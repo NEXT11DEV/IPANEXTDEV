@@ -131,8 +131,8 @@
       border-radius: 50%;
       border: 2px solid #00d2ff;
       box-shadow: 0 0 30px rgba(138, 0, 255, 0.8), 0 0 15px rgba(0, 210, 255, 0.5);
-      /* رابط الصورة الفخمة التي أرسلتها */
-      background: #0f081d url('https://i.postimg.co/25wQrmwN/anime-demon-angel.jpg') center/cover no-repeat;
+      /* الرابط الجديد للصورة التي طلبتها */
+      background: #0f081d url('https://c.top4top.io/p_3920gea911.jpg') center/cover no-repeat;
     }
 
     h1 {
@@ -257,18 +257,16 @@
   <script>
     let voicePlayed = false;
 
-    // دالة نطق الصوت الترحيبي
     function playVoice() {
       if (!voicePlayed && 'speechSynthesis' in window) {
         let msg = new SpeechSynthesisUtterance("أهلاً بكم في IPA NEXT");
         msg.lang = 'ar-SA';
-        msg.rate = 0.9; // سرعة الصوت
+        msg.rate = 0.9;
         window.speechSynthesis.speak(msg);
         voicePlayed = true;
       }
     }
 
-    // تشغيل الصوت وإخفاء الانترو عند التحميل أو عند لمس الشاشة
     window.addEventListener('DOMContentLoaded', () => {
       document.body.addEventListener('click', playVoice, { once: true });
       
