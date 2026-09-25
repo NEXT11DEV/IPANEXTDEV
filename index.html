@@ -13,105 +13,218 @@
       font-family: 'Cairo', sans-serif;
     }
     body {
-      background: #08090c;
-      background-image: radial-gradient(circle at top, #121829 0%, #08090c 80%);
+      background: #040209;
+      background-image: radial-gradient(circle at top, #15092b 0%, #040209 85%);
       color: #fff;
       min-height: 100vh;
       display: flex;
       justify-content: center;
       align-items: center;
       padding: 20px;
+      overflow: hidden;
     }
+
+    /* شاشة الدخول الفخمة (بنفسجي وأزرق) */
+    #intro-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: #020105;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999;
+      transition: opacity 0.8s ease, visibility 0.8s ease;
+    }
+
+    /* تأثير الانفجار البنفسجي والأزرق */
+    .explosion-ring {
+      position: absolute;
+      width: 5px;
+      height: 5px;
+      background: rgba(157, 0, 255, 0.9);
+      border-radius: 50%;
+      box-shadow: 0 0 50px 30px #8a00ff, 0 0 100px 60px #00d2ff;
+      animation: explode 1.2s cubic-bezier(0.1, 0.8, 0.3, 1) forwards;
+    }
+
+    @keyframes explode {
+      0% {
+        transform: scale(1);
+        opacity: 1;
+      }
+      50% {
+        opacity: 0.8;
+      }
+      100% {
+        transform: scale(350);
+        opacity: 0;
+      }
+    }
+
+    /* نص IPA NEXT الفخم */
+    .intro-title {
+      position: relative;
+      font-size: 50px;
+      font-weight: 1000;
+      color: #ffffff;
+      letter-spacing: 4px;
+      text-transform: uppercase;
+      text-shadow: 0 0 10px #a100ff, 0 0 20px #8a00ff, 0 0 40px #00d2ff, 0 0 80px #7000ff;
+      animation: titlePower 1.8s ease-in-out forwards;
+      z-index: 2;
+    }
+
+    .intro-sub {
+      position: relative;
+      font-size: 14px;
+      color: #00d2ff;
+      letter-spacing: 3px;
+      margin-top: 12px;
+      font-weight: 800;
+      text-shadow: 0 0 10px rgba(0, 210, 255, 0.8);
+      z-index: 2;
+      animation: fadeInSub 2s ease forwards;
+    }
+
+    @keyframes titlePower {
+      0% {
+        transform: scale(0.3);
+        opacity: 0;
+        filter: blur(10px);
+      }
+      50% {
+        transform: scale(1.15);
+        opacity: 1;
+        filter: blur(0px);
+      }
+      100% {
+        transform: scale(1);
+        opacity: 1;
+      }
+    }
+
+    @keyframes fadeInSub {
+      0% { opacity: 0; transform: translateY(10px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
+
+    .fade-out {
+      opacity: 0;
+      visibility: hidden;
+    }
+
+    /* كارت الموقع الرئيسي */
     .container {
       width: 100%;
       max-width: 450px;
-      background: rgba(15, 20, 32, 0.7);
-      backdrop-filter: blur(16px);
-      border: 1px solid rgba(0, 210, 255, 0.2);
-      border-radius: 20px;
+      background: rgba(12, 6, 24, 0.82);
+      backdrop-filter: blur(18px);
+      border: 1px solid rgba(138, 0, 255, 0.35);
+      border-radius: 22px;
       padding: 35px 25px;
       text-align: center;
-      box-shadow: 0 0 30px rgba(0, 210, 255, 0.1);
+      box-shadow: 0 0 40px rgba(112, 0, 255, 0.25);
+      animation: cardAppear 1s ease-out forwards;
     }
+
+    @keyframes cardAppear {
+      from { opacity: 0; transform: translateY(30px) scale(0.95); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
     .profile-box {
       position: relative;
-      width: 110px;
-      height: 110px;
+      width: 120px;
+      height: 120px;
       margin: 0 auto 20px;
     }
+
     .avatar {
       width: 100%;
       height: 100%;
       border-radius: 50%;
       border: 2px solid #00d2ff;
-      box-shadow: 0 0 20px rgba(0, 210, 255, 0.5);
-      /* رابط مباشر موثوق يعمل عبر الكود مباشرة */
-      background: #10141f url('https://i.postimg.co/3w1xX100/anime-boy.jpg') center/cover no-repeat;
+      box-shadow: 0 0 30px rgba(138, 0, 255, 0.8), 0 0 15px rgba(0, 210, 255, 0.5);
+      /* صورتك الفخمة التي أرسلتها سابقاً */
+      background: #0f081d url('https://i.postimg.co/25wQrmwN/anime-demon-angel.jpg') center/cover no-repeat;
     }
+
     h1 {
-      font-size: 24px;
+      font-size: 26px;
       font-weight: 1000;
       color: #00d2ff;
       letter-spacing: 1px;
-      text-shadow: 0 0 10px rgba(0, 210, 255, 0.5);
+      text-shadow: 0 0 15px rgba(0, 210, 255, 0.8), 0 0 25px rgba(112, 0, 255, 0.6);
       margin-bottom: 6px;
     }
+
     p.subtitle {
       font-size: 13px;
-      color: #8a99ad;
-      margin-bottom: 30px;
+      color: #a894d9;
+      margin-bottom: 25px;
       font-weight: 600;
     }
+
     .links-list {
       display: flex;
       flex-direction: column;
       gap: 14px;
     }
+
     .btn {
       display: flex;
       justify-content: space-between;
       align-items: center;
       padding: 16px 20px;
       background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(0, 210, 255, 0.2);
       border-radius: 12px;
-      color: #e1e7ed;
+      color: #f0f3f7;
       text-decoration: none;
       font-size: 15px;
       font-weight: 800;
       transition: all 0.25s ease;
       cursor: pointer;
     }
+
     .btn:hover {
-      background: rgba(0, 210, 255, 0.1);
+      background: rgba(0, 210, 255, 0.15);
       border-color: #00d2ff;
       color: #fff;
-      box-shadow: 0 0 15px rgba(0, 210, 255, 0.3);
+      box-shadow: 0 0 20px rgba(0, 210, 255, 0.5);
       transform: translateY(-2px);
     }
+
     .btn-copy {
-      background: rgba(112, 0, 255, 0.1);
-      border-color: rgba(112, 0, 255, 0.3);
+      background: rgba(112, 0, 255, 0.15);
+      border-color: rgba(138, 0, 255, 0.4);
     }
+
     .btn-copy:hover {
-      background: rgba(112, 0, 255, 0.25);
-      border-color: #7000ff;
-      box-shadow: 0 0 15px rgba(112, 0, 255, 0.4);
+      background: rgba(112, 0, 255, 0.35);
+      border-color: #9d00ff;
+      box-shadow: 0 0 20px rgba(157, 0, 255, 0.6);
     }
+
     .toast {
       position: fixed;
       bottom: -60px;
       left: 50%;
       transform: translateX(-50%);
-      background: #00d2ff;
-      color: #08090c;
+      background: #8a00ff;
+      color: #fff;
       font-weight: 800;
       padding: 12px 30px;
       border-radius: 10px;
       font-size: 14px;
       transition: all 0.3s ease;
-      box-shadow: 0 0 20px rgba(0, 210, 255, 0.5);
+      box-shadow: 0 0 25px rgba(138, 0, 255, 0.8);
     }
+
     .toast.show {
       bottom: 30px;
     }
@@ -119,6 +232,14 @@
 </head>
 <body>
 
+  <!-- شاشة الدخول الانفجارية باللون البنفسجي والأزرق -->
+  <div id="intro-screen">
+    <div class="explosion-ring"></div>
+    <div class="intro-title">IPA NEXT</div>
+    <div class="intro-sub">WELCOME TO THE DOMAIN ⚡</div>
+  </div>
+
+  <!-- الكارت الرئيسي -->
   <div class="container">
     <div class="profile-box">
       <div class="avatar"></div>
@@ -152,6 +273,13 @@
   <div id="toast" class="toast">تم النسخ بنجاح! ⚡</div>
 
   <script>
+    window.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        document.getElementById('intro-screen').classList.add('fade-out');
+        document.body.style.overflow = 'auto';
+      }, 2300);
+    });
+
     function copyText(text) {
       navigator.clipboard.writeText(text).then(() => {
         let toast = document.getElementById("toast");
