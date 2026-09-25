@@ -1,0 +1,170 @@
+# IPANEXTDEV<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NEXT IPA IOS</title>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;800;1000&display=swap" rel="stylesheet">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Cairo', sans-serif;
+    }
+    body {
+      background: #08090c;
+      background-image: radial-gradient(circle at top, #121829 0%, #08090c 80%);
+      color: #fff;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
+    .container {
+      width: 100%;
+      max-width: 450px;
+      background: rgba(15, 20, 32, 0.7);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(0, 210, 255, 0.2);
+      border-radius: 20px;
+      padding: 35px 25px;
+      text-align: center;
+      box-shadow: 0 0 30px rgba(0, 210, 255, 0.1);
+    }
+    .profile-box {
+      position: relative;
+      width: 105px;
+      height: 105px;
+      margin: 0 auto 20px;
+    }
+    .avatar {
+      width: 100%;
+      height: 100%;
+      border-radius: 18px;
+      border: 2px solid #00d2ff;
+      box-shadow: 0 0 20px rgba(0, 210, 255, 0.4);
+      background: #10141f url('https://i.postimg.co/3w1xX100/anime-boy.jpg') center/cover;
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 1000;
+      color: #00d2ff;
+      letter-spacing: 1px;
+      text-shadow: 0 0 10px rgba(0, 210, 255, 0.5);
+      margin-bottom: 6px;
+    }
+    p.subtitle {
+      font-size: 13px;
+      color: #8a99ad;
+      margin-bottom: 30px;
+      font-weight: 600;
+    }
+    .links-list {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .btn {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      color: #e1e7ed;
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 800;
+      transition: all 0.25s ease;
+      cursor: pointer;
+    }
+    .btn:hover {
+      background: rgba(0, 210, 255, 0.1);
+      border-color: #00d2ff;
+      color: #fff;
+      box-shadow: 0 0 15px rgba(0, 210, 255, 0.3);
+      transform: translateY(-2px);
+    }
+    .btn-copy {
+      background: rgba(112, 0, 255, 0.1);
+      border-color: rgba(112, 0, 255, 0.3);
+    }
+    .btn-copy:hover {
+      background: rgba(112, 0, 255, 0.25);
+      border-color: #7000ff;
+      box-shadow: 0 0 15px rgba(112, 0, 255, 0.4);
+    }
+    .toast {
+      position: fixed;
+      bottom: -60px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #00d2ff;
+      color: #08090c;
+      font-weight: 800;
+      padding: 12px 30px;
+      border-radius: 10px;
+      font-size: 14px;
+      transition: all 0.3s ease;
+      box-shadow: 0 0 20px rgba(0, 210, 255, 0.5);
+    }
+    .toast.show {
+      bottom: 30px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <div class="profile-box">
+      <div class="avatar"></div>
+    </div>
+    <h1>NEXT IPA IOS</h1>
+    <p class="subtitle">ANIME & CONTENT CREATOR ⚡</p>
+
+    <div class="links-list">
+      <!-- حساب TikTok -->
+      <a href="https://www.tiktok.com/@x1next1" target="_blank" class="btn">
+        <span>🎬 حساب الـ TikTok</span>
+        <span>TikTok ↗</span>
+      </a>
+
+      <!-- للتواصل عبر Telegram -->
+      <a href="https://t.me/YG8_1" target="_blank" class="btn">
+        <span>💬 للتواصل عبر Telegram</span>
+        <span>Telegram ↗</span>
+      </a>
+
+      <!-- زر نسخ رابط التليجرام -->
+      <button class="btn btn-copy" onclick="copyText('https://t.me/YG8_1')">
+        <span>📋 نسخ رابط التليجرام</span>
+        <span>Copy</span>
+      </button>
+
+      <!-- زر نسخ رابط الموقع -->
+      <button class="btn btn-copy" onclick="copyText('https://NEXT11DEV.github.io/NEXTDEV.Yousif/')">
+        <span>🌐 نسخ رابط الموقع</span>
+        <span>Copy</span>
+      </button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">تم النسخ بنجاح! ⚡</div>
+
+  <script>
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        let toast = document.getElementById("toast");
+        toast.classList.add("show");
+        setTimeout(() => {
+          toast.classList.remove("show");
+        }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>
