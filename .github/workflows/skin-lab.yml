@@ -1,0 +1,21 @@
+name: SkinLab cosmetic trial
+on:
+  push:
+    branches: [activation-kit-ios-20261105]
+    paths: ['skin-lab/**', '.github/workflows/skin-lab.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile cosmetic trial
+        working-directory: skin-lab
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SkinLab-unsigned
+          path: skin-lab/out/SkinLab.framework
+          retention-days: 1
