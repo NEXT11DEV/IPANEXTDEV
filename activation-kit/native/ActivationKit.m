@@ -1,10 +1,12 @@
 #import "ActivationKit.h"
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 static NSString *const Origin=@"https://activation-console.yousifjiboori.chatgpt.site";
 static NSString *const Service=@"local.activation.account";
 static NSDictionary *Account;
-static BOOL Granted=NO;
+static _Atomic(bool) Granted=false;
 static UIWindow *Overlay;
 static UIWindow *Previous;
 static CFAbsoluteTime LastFrame=0;
@@ -76,7 +78,7 @@ static void Present(BOOL accountMode);
 @end
 static void Present(BOOL accountMode){
  if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{Present(accountMode);});return;}
- if(Overlay&&!Overlay.hidden)return;
+ if(Overlay&&!Overlay.hidden){if(!accountMode&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&((ActivationPanel*)Overlay.rootViewController).accountMode)Overlay.hidden=YES;else return;}
  UIWindowScene *scene=nil;for(UIScene *s in UIApplication.sharedApplication.connectedScenes)if([s isKindOfClass:UIWindowScene.class]&&s.activationState==UISceneActivationStateForegroundActive){scene=(UIWindowScene*)s;break;}if(!scene)return;
  for(UIWindow *w in scene.windows)if(w.isKeyWindow&&w!=Overlay){Previous=w;break;}
  if(!Overlay){Overlay=[[UIWindow alloc]initWithWindowScene:scene];Overlay.frame=scene.coordinateSpace.bounds;Overlay.windowLevel=UIWindowLevelAlert+1;}
@@ -85,5 +87,5 @@ static void Present(BOOL accountMode){
 BOOL ActivationAccessActive(void){@synchronized(ActivationPanel.class){return Granted;}}
 void ActivationShowLogin(void){Present(NO);}
 void ActivationAccountFrame(void){CFAbsoluteTime now=CFAbsoluteTimeGetCurrent();BOOL enter;@synchronized(ActivationPanel.class){enter=now-LastFrame>.7;LastFrame=now;}if(enter)Present(Granted);}
-static void Validate(void){if(!ReadSecret(@"session")){Granted=NO;Present(NO);return;}API(@"/api/account",nil,^(NSDictionary *j,NSString *error){if(error||![j[@"account"]isKindOfClass:NSDictionary.class]){Granted=NO;Present(NO);return;}Account=j[@"account"];Granted=[Account[@"status"]isEqual:@"active"];if(!Granted)Present(NO);});}
+static void Validate(void){if(!ReadSecret(@"session")){Granted=NO;Present(NO);return;}API(@"/api/account",nil,^(NSDictionary *j,NSString *error){if(error||![j[@"account"]isKindOfClass:NSDictionary.class]){Granted=NO;Present(NO);return;}Account=j[@"account"];Granted=[Account[@"status"]isEqual:@"active"];if(!Granted)Present(NO);else if(Overlay&&!Overlay.hidden&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&!((ActivationPanel*)Overlay.rootViewController).accountMode){Overlay.hidden=YES;[Previous makeKeyWindow];}});}
 __attribute__((constructor))static void StartActivation(void){dispatch_async(dispatch_get_main_queue(),^{[NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){Validate();}];[NSTimer scheduledTimerWithTimeInterval:45 repeats:YES block:^(NSTimer *t){Validate();}];dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{Validate();});});}
