@@ -1,0 +1,21 @@
+name: SkinProbe iOS diagnostic
+on:
+  push:
+    branches: [activation-kit-ios-20261105]
+    paths: ['skin-diagnostics/**', '.github/workflows/skin-probe.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile read-only diagnostic
+        working-directory: skin-diagnostics
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SkinProbe-unsigned
+          path: skin-diagnostics/out/SkinProbe.framework
+          retention-days: 1
