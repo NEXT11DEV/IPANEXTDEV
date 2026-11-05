@@ -1,6 +1,6 @@
 """Add a separately compiled read-only diagnostic to the supplied donor IPA."""
 from pathlib import Path
-import hashlib,json,struct,zipfile
+import copy,hashlib,json,struct,zipfile
 root=Path(__file__).resolve().parent.parent
 source=root/'upload/Ninja_8BP_v56330326(1).ipa'
 artifact=root/'output/SkinProbe-unsigned.zip'
@@ -43,7 +43,7 @@ with zipfile.ZipFile(source) as original,zipfile.ZipFile(artifact) as framework:
         new.append((f'Payload/pool.app/Frameworks/SkinProbe.framework/{filename}',data,filename=='SkinProbe'))
     with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as result:
         for info in original.infolist():
-            result.writestr(info,bytes(binary) if info.filename==main else original.read(info.filename))
+            result.writestr(copy.copy(info),bytes(binary) if info.filename==main else original.read(info.filename))
         for name,data,executable in new:
             info=zipfile.ZipInfo(name)
             info.create_system=3
