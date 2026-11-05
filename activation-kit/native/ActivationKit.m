@@ -6,6 +6,7 @@
 static NSString *const Origin=@"https://activation-console.yousifjiboori.chatgpt.site";
 static NSString *const Service=@"local.activation.account";
 static NSDictionary *Account;
+static NSTimeInterval ServerOffset;
 static _Atomic(bool) Granted=false;
 static UIWindow *Overlay;
 static UIWindow *Previous;
@@ -69,16 +70,16 @@ static void Present(BOOL accountMode);
  }
  [stack addArrangedSubview:self.message];
 }
-- (void)updateCounter{NSInteger left=MAX(0,(NSInteger)(self.expiry-NSDate.date.timeIntervalSince1970-self.serverOffset));self.countdown.text=[NSString stringWithFormat:@"%02ld يوم  :  %02ld ساعة  :  %02ld دقيقة  :  %02ld ثانية",(long)(left/86400),(long)(left%86400/3600),(long)(left%3600/60),(long)(left%60)];if(left==0){Granted=NO;self.message.text=@"انتهت مدة الاشتراك";}}
+- (void)updateCounter{self.expiry=[Account[@"expires"] doubleValue]/1000.0;self.serverOffset=ServerOffset;NSInteger left=MAX(0,(NSInteger)(self.expiry-NSDate.date.timeIntervalSince1970-self.serverOffset));self.countdown.text=[NSString stringWithFormat:@"%02ld يوم  :  %02ld ساعة  :  %02ld دقيقة  :  %02ld ثانية",(long)(left/86400),(long)(left%86400/3600),(long)(left%3600/60),(long)(left%60)];if(left==0){Granted=NO;self.message.text=@"انتهت مدة الاشتراك";[self.timer invalidate];dispatch_async(dispatch_get_main_queue(),^{Present(NO);});}}
 - (void)activate{NSString *code=[[self.code.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]uppercaseString];if(code.length!=23){self.message.text=@"تحقق من صيغة كود التفعيل";return;}self.submit.enabled=NO;self.message.text=@"جارِ التحقق…";NSString *device=ReadSecret(@"installation");if(!device){device=NSUUID.UUID.UUIDString;WriteSecret(@"installation",device);}__weak typeof(self) weakSelf=self;
- API(@"/api/activate",@{@"code":code,@"device":device},^(NSDictionary *j,NSString *error){__strong typeof(weakSelf) s=weakSelf;if(!s)return;s.submit.enabled=YES;if(error){s.message.text=error;return;}if(![j[@"token"]isKindOfClass:NSString.class]||![j[@"account"]isKindOfClass:NSDictionary.class]){s.message.text=@"استجابة غير صالحة";return;}Account=j[@"account"];Granted=[Account[@"status"]isEqual:@"active"];WriteSecret(@"session",j[@"token"]);if(Granted)[s closePanel];else s.message.text=@"الاشتراك غير فعّال";});
+ API(@"/api/activate",@{@"code":code,@"device":device},^(NSDictionary *j,NSString *error){__strong typeof(weakSelf) s=weakSelf;if(!s)return;s.submit.enabled=YES;if(error){s.message.text=error;return;}if(![j[@"token"]isKindOfClass:NSString.class]||![j[@"account"]isKindOfClass:NSDictionary.class]){s.message.text=@"استجابة غير صالحة";return;}Account=j[@"account"];ServerOffset=[Account[@"serverTime"] doubleValue]/1000.0-NSDate.date.timeIntervalSince1970;Granted=[Account[@"status"]isEqual:@"active"];WriteSecret(@"session",j[@"token"]);if(Granted)[s closePanel];else s.message.text=@"الاشتراك غير فعّال";});
 }
 - (void)closePanel{if(!Granted)return;[self.timer invalidate];Overlay.hidden=YES;[Previous makeKeyWindow];}
 - (void)dealloc{[_timer invalidate];}
 @end
 static void Present(BOOL accountMode){
  if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{Present(accountMode);});return;}
- if(Overlay&&!Overlay.hidden){if(!accountMode&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&((ActivationPanel*)Overlay.rootViewController).accountMode)Overlay.hidden=YES;else return;}
+ if(Overlay&&!Overlay.hidden){if(!accountMode&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&((ActivationPanel*)Overlay.rootViewController).accountMode){[((ActivationPanel*)Overlay.rootViewController).timer invalidate];Overlay.hidden=YES;}else return;}
  UIWindowScene *scene=nil;for(UIScene *s in UIApplication.sharedApplication.connectedScenes)if([s isKindOfClass:UIWindowScene.class]&&s.activationState==UISceneActivationStateForegroundActive){scene=(UIWindowScene*)s;break;}if(!scene)return;
  for(UIWindow *w in scene.windows)if(w.isKeyWindow&&w!=Overlay){Previous=w;break;}
  if(!Overlay){Overlay=[[UIWindow alloc]initWithWindowScene:scene];Overlay.frame=scene.coordinateSpace.bounds;Overlay.windowLevel=UIWindowLevelAlert+1;}
@@ -87,5 +88,5 @@ static void Present(BOOL accountMode){
 BOOL ActivationAccessActive(void){@synchronized(ActivationPanel.class){return Granted;}}
 void ActivationShowLogin(void){Present(NO);}
 void ActivationAccountFrame(void){CFAbsoluteTime now=CFAbsoluteTimeGetCurrent();BOOL enter;@synchronized(ActivationPanel.class){enter=now-LastFrame>.7;LastFrame=now;}if(enter)Present(Granted);}
-static void Validate(void){if(!ReadSecret(@"session")){Granted=NO;Present(NO);return;}API(@"/api/account",nil,^(NSDictionary *j,NSString *error){if(error||![j[@"account"]isKindOfClass:NSDictionary.class]){Granted=NO;Present(NO);return;}Account=j[@"account"];Granted=[Account[@"status"]isEqual:@"active"];if(!Granted)Present(NO);else if(Overlay&&!Overlay.hidden&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&!((ActivationPanel*)Overlay.rootViewController).accountMode){Overlay.hidden=YES;[Previous makeKeyWindow];}});}
+static void Validate(void){if(!ReadSecret(@"session")){Granted=NO;Present(NO);return;}API(@"/api/account",nil,^(NSDictionary *j,NSString *error){if(error||![j[@"account"]isKindOfClass:NSDictionary.class]){Granted=NO;Present(NO);return;}Account=j[@"account"];ServerOffset=[Account[@"serverTime"] doubleValue]/1000.0-NSDate.date.timeIntervalSince1970;Granted=[Account[@"status"]isEqual:@"active"];if(!Granted)Present(NO);else if(Overlay&&!Overlay.hidden&&[Overlay.rootViewController isKindOfClass:ActivationPanel.class]&&!((ActivationPanel*)Overlay.rootViewController).accountMode){Overlay.hidden=YES;[Previous makeKeyWindow];}});}
 __attribute__((constructor))static void StartActivation(void){dispatch_async(dispatch_get_main_queue(),^{[NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){Validate();}];[NSTimer scheduledTimerWithTimeInterval:45 repeats:YES block:^(NSTimer *t){Validate();}];dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{Validate();});});}
