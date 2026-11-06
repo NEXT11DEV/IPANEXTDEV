@@ -4,14 +4,29 @@
 #import <mach-o/dyld.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 static NSString *const Origin=@"https://activation-console.yousifjiboori.chatgpt.site";
 static NSString *const Service=@"local.activation.account";
 static NSDictionary *Account;
-static NSTimeInterval ServerOffset;
 static _Atomic(bool) Granted=false;
 static UIWindow *Overlay;
 static UIWindow *Previous;
-static CFAbsoluteTime LastFrame=0;
+static _Atomic(bool) LoginVisible=false;
+static _Atomic(double) ExpirationUptime,GraceDeadline;
+static NSString *SessionToken;
+static BOOL Validating,Activating,InitialValidationFinished;
+static unsigned SessionGeneration;
+static NSTimeInterval NextValidation;
+static double Uptime(void){return NSProcessInfo.processInfo.systemUptime;}
+static BOOL InMatch(void){Class cls=objc_getClass("GameManager");SEL shared=sel_registerName("sharedGameManager"),started=sel_registerName("isGameStarted");if(!cls||![cls respondsToSelector:shared])return NO;id manager=((id(*)(id,SEL))objc_msgSend)(cls,shared);if(!manager||![manager respondsToSelector:started])return NO;return ((BOOL(*)(id,SEL))objc_msgSend)(manager,started);}
+static BOOL AcceptAccount(NSDictionary *account){
+ if(![account isKindOfClass:NSDictionary.class]||![account[@"status"]isEqual:@"active"]){Granted=NO;return NO;}
+ double server=[account[@"serverTime"]doubleValue]/1000.0,expires=[account[@"expires"]doubleValue]/1000.0;
+ if(server<=0||expires<=server){Granted=NO;return NO;}
+ Account=account;double now=Uptime();atomic_store(&ExpirationUptime,now+expires-server);atomic_store(&GraceDeadline,now+90);Granted=YES;return YES;
+}
+static void DismissLogin(void){if(Overlay&&!Overlay.hidden){Overlay.hidden=YES;[Previous makeKeyWindow];}LoginVisible=false;}
 static NSString *ReadSecret(NSString *name){
  NSDictionary *q=@{(__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,(__bridge id)kSecAttrService:Service,(__bridge id)kSecAttrAccount:name,(__bridge id)kSecReturnData:@YES,(__bridge id)kSecMatchLimit:(__bridge id)kSecMatchLimitOne};CFTypeRef value=NULL;
  if(SecItemCopyMatching((__bridge CFDictionaryRef)q,&value)!=errSecSuccess)return nil;
@@ -21,16 +36,16 @@ static void WriteSecret(NSString *name,NSString *value){
  NSDictionary *q=@{(__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,(__bridge id)kSecAttrService:Service,(__bridge id)kSecAttrAccount:name};SecItemDelete((__bridge CFDictionaryRef)q);if(!value)return;
  NSMutableDictionary *a=[q mutableCopy];a[(__bridge id)kSecValueData]=[value dataUsingEncoding:NSUTF8StringEncoding];a[(__bridge id)kSecAttrAccessible]=(__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;SecItemAdd((__bridge CFDictionaryRef)a,NULL);
 }
-static void API(NSString *path,NSDictionary *body,void(^done)(NSDictionary *,NSString *)){
+static void API(NSString *path,NSDictionary *body,void(^done)(NSDictionary *,NSString *,NSInteger)){
  NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[Origin stringByAppendingString:path]]];r.timeoutInterval=15;
  if(body){r.HTTPMethod=@"POST";[r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];r.HTTPBody=[NSJSONSerialization dataWithJSONObject:body options:0 error:nil];}
- NSString *token=ReadSecret(@"session");if(token)[r setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+ NSString *token=SessionToken;if(token)[r setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
  [[[NSURLSession sharedSession]dataTaskWithRequest:r completionHandler:^(NSData *d,NSURLResponse *response,NSError *e){
   NSDictionary *j=d?[NSJSONSerialization JSONObjectWithData:d options:0 error:nil]:nil;
   if(![j isKindOfClass:NSDictionary.class])j=nil;
   NSInteger status=[response isKindOfClass:NSHTTPURLResponse.class]?((NSHTTPURLResponse*)response).statusCode:0;
   NSString *error=e?@"تعذر الاتصال بالسيرفر":(status<200||status>=300)?(j[@"error"]?:@"تعذر التحقق من الاشتراك"):nil;
-  dispatch_async(dispatch_get_main_queue(),^{done(j,error);});
+  dispatch_async(dispatch_get_main_queue(),^{done(j,error,status);});
  }]resume];
 }
 static BOOL IntroDone(void){for(uint32_t i=0;i<_dyld_image_count();i++){const char *name=_dyld_get_image_name(i);if(name&&strstr(name,"/ninja.framework/ninja")){const uint8_t *base=(const uint8_t*)_dyld_get_image_header(i);return *((volatile const uint8_t*)(base+0x10ffac))==1;}}return NO;}
@@ -44,7 +59,7 @@ static BOOL IntroDone(void){for(uint32_t i=0;i<_dyld_image_count();i++){const ch
 @property(nonatomic) UIInterfaceOrientation desiredOrientation;
 @property(nonatomic) CGFloat keyboardShift;
 @end
-static void Present(BOOL unused);
+static void Present(BOOL explicitRequest);
 @implementation ActivationPanel
 - (BOOL)shouldAutorotate{return YES;}
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations{return UIInterfaceOrientationMaskLandscape;}
@@ -77,14 +92,31 @@ static void Present(BOOL unused);
 - (void)pasteKey {NSString*s=UIPasteboard.generalPasteboard.string;if(s)self.code.text=[s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];}
 - (void)changeLanguage {self.arabic=!self.arabic;self.titleLabel.text=self.arabic?@"مرحباً بعودتك":@"Welcome Back";self.subtitle.text=self.arabic?@"أدخل مفتاح التفعيل":@"Enter your activation key";self.usernameLabel.text=self.arabic?@"اسم المستخدم":@"Username";self.passwordLabel.text=self.arabic?@"كلمة المرور":@"Password";[self.submit setTitle:self.arabic?@"تسجيل الدخول":@"Login" forState:UIControlStateNormal];[self.language setTitle:self.arabic?@"◎  العربية  ⌄":@"◎  English  ⌄" forState:UIControlStateNormal];}
 - (void)openWebsite {NSURL*u=[NSURL URLWithString:Origin];[UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];}
-- (void)activate {NSString *code=[[self.code.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]uppercaseString],*username=[self.username.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];if(!username.length||code.length!=23){self.message.text=self.arabic?@"أدخل اسم المستخدم والكود الصحيح":@"Enter username and activation key";return;}[self.view endEditing:YES];self.submit.enabled=NO;self.message.text=self.arabic?@"جارِ التحقق…":@"Checking…";NSString*device=ReadSecret(@"installation");if(!device){device=NSUUID.UUID.UUIDString;WriteSecret(@"installation",device);}__weak typeof(self)weakSelf=self;API(@"/api/activate",@{@"code":code,@"device":device,@"username":username},^(NSDictionary*j,NSString*error){__strong typeof(weakSelf)s=weakSelf;if(!s)return;s.submit.enabled=YES;if(error){s.message.text=error;return;}if(![j[@"token"]isKindOfClass:NSString.class]||![j[@"account"]isKindOfClass:NSDictionary.class]){s.message.text=@"Invalid server response";return;}Account=j[@"account"];ServerOffset=[Account[@"serverTime"]doubleValue]/1000.0-NSDate.date.timeIntervalSince1970;Granted=[Account[@"status"]isEqual:@"active"];WriteSecret(@"session",j[@"token"]);WriteSecret(@"username",username);if(Granted){Overlay.hidden=YES;[Previous makeKeyWindow];}else s.message.text=@"Subscription inactive";});}
+- (void)activate {NSString *code=[[self.code.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]uppercaseString],*username=[self.username.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];if(!username.length||code.length!=23){self.message.text=self.arabic?@"أدخل اسم المستخدم والكود الصحيح":@"Enter username and activation key";return;}[self.view endEditing:YES];self.submit.enabled=NO;Activating=YES;self.message.text=self.arabic?@"جارِ التحقق…":@"Checking…";NSString*device=ReadSecret(@"installation");if(!device){device=NSUUID.UUID.UUIDString;WriteSecret(@"installation",device);}__weak typeof(self)weakSelf=self;API(@"/api/activate",@{@"code":code,@"device":device,@"username":username},^(NSDictionary*j,NSString*error,NSInteger status){(void)status;Activating=NO;__strong typeof(weakSelf)s=weakSelf;if(!s)return;s.submit.enabled=YES;if(error){s.message.text=error;return;}if(![j[@"token"]isKindOfClass:NSString.class]||![j[@"account"]isKindOfClass:NSDictionary.class]){s.message.text=@"Invalid server response";return;}SessionGeneration++;SessionToken=j[@"token"];WriteSecret(@"session",SessionToken);WriteSecret(@"username",username);NextValidation=Uptime()+45;if(AcceptAccount(j[@"account"]))DismissLogin();else s.message.text=@"Subscription inactive";});}
 - (void)dealloc {[NSNotificationCenter.defaultCenter removeObserver:self];}
 @end
-static void Present(BOOL unused){if(!IntroDone())return;if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{Present(NO);});return;}if(Overlay&&!Overlay.hidden)return;UIWindowScene*scene=nil;for(UIScene*s in UIApplication.sharedApplication.connectedScenes)if([s isKindOfClass:UIWindowScene.class]&&s.activationState==UISceneActivationStateForegroundActive){scene=(UIWindowScene*)s;break;}if(!scene)return;for(UIWindow*w in scene.windows)if(w.isKeyWindow&&w!=Overlay){Previous=w;break;}if(!Overlay){Overlay=[[UIWindow alloc]initWithWindowScene:scene];Overlay.windowLevel=UIWindowLevelAlert+1;}ActivationPanel*panel=[ActivationPanel new];panel.desiredOrientation=scene.interfaceOrientation;Overlay.rootViewController=panel;[Overlay makeKeyAndVisible];if(@available(iOS 16.0,*)){[panel setNeedsUpdateOfSupportedInterfaceOrientations];UIWindowSceneGeometryPreferencesIOS*p=[[UIWindowSceneGeometryPreferencesIOS alloc]initWithInterfaceOrientations:(panel.desiredOrientation==UIInterfaceOrientationLandscapeLeft?UIInterfaceOrientationMaskLandscapeLeft:UIInterfaceOrientationMaskLandscapeRight)];[scene requestGeometryUpdateWithPreferences:p errorHandler:^(NSError*e){NSLog(@"Activation landscape request failed: %@",e.localizedDescription);}];}else{[UIViewController attemptRotationToDeviceOrientation];}}
-BOOL ActivationAccessActive(void){return Granted;}
+static void Present(BOOL explicitRequest){if(!IntroDone()||(!explicitRequest&&InMatch()))return;if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{Present(explicitRequest);});return;}if(Overlay&&!Overlay.hidden)return;UIWindowScene*scene=nil;for(UIScene*s in UIApplication.sharedApplication.connectedScenes)if([s isKindOfClass:UIWindowScene.class]&&s.activationState==UISceneActivationStateForegroundActive){scene=(UIWindowScene*)s;break;}if(!scene)return;for(UIWindow*w in scene.windows)if(w.isKeyWindow&&w!=Overlay){Previous=w;break;}if(!Overlay){Overlay=[[UIWindow alloc]initWithWindowScene:scene];Overlay.windowLevel=UIWindowLevelAlert+1;}ActivationPanel*panel=[ActivationPanel new];panel.desiredOrientation=scene.interfaceOrientation;Overlay.rootViewController=panel;LoginVisible=true;[Overlay makeKeyAndVisible];if(@available(iOS 16.0,*)){[panel setNeedsUpdateOfSupportedInterfaceOrientations];UIWindowSceneGeometryPreferencesIOS*p=[[UIWindowSceneGeometryPreferencesIOS alloc]initWithInterfaceOrientations:(panel.desiredOrientation==UIInterfaceOrientationLandscapeLeft?UIInterfaceOrientationMaskLandscapeLeft:UIInterfaceOrientationMaskLandscapeRight)];[scene requestGeometryUpdateWithPreferences:p errorHandler:^(NSError*e){NSLog(@"Activation landscape request failed: %@",e.localizedDescription);}];}else{[UIViewController attemptRotationToDeviceOrientation];}}
+BOOL ActivationAccessActive(void){double now=Uptime();return Granted&&now<atomic_load(&ExpirationUptime)&&now<atomic_load(&GraceDeadline);}
+BOOL ActivationLoginVisible(void){return LoginVisible;}
 void ActivationShowLogin(void){Present(NO);}
 void ActivationAccountFrame(void){}
-void ActivationFillExpiryParts(void *result){if(!result)return;memset(result,0,40);if(!Granted||!Account)return;NSTimeInterval remaining=[Account[@"expires"]doubleValue]/1000.0-NSDate.date.timeIntervalSince1970-ServerOffset;uint64_t t=remaining>0?(uint64_t)remaining:0;*((uint8_t*)result)=1;uint64_t*p=result;p[1]=t/86400;p[2]=(t%86400)/3600;p[3]=(t%3600)/60;p[4]=t%60;}
-void ActivationSyncUsername(void *target,void(*assign)(void*,const char*,size_t)){@autoreleasepool{if(!target||!assign||!Granted)return;NSString*name=Account[@"name"];if(![name isKindOfClass:NSString.class])return;const char*s=name.UTF8String;if(s)assign(target,s,strlen(s));}}
-static void Validate(void){if(!IntroDone())return;if(!ReadSecret(@"session")){Granted=NO;Present(NO);return;}API(@"/api/account",nil,^(NSDictionary*j,NSString*error){if(error||![j[@"account"]isKindOfClass:NSDictionary.class]){Granted=NO;Present(NO);return;}Account=j[@"account"];ServerOffset=[Account[@"serverTime"]doubleValue]/1000.0-NSDate.date.timeIntervalSince1970;Granted=[Account[@"status"]isEqual:@"active"];if(!Granted)Present(NO);else if(Overlay&&!Overlay.hidden){Overlay.hidden=YES;[Previous makeKeyWindow];}});}
-__attribute__((constructor))static void StartActivation(void){dispatch_async(dispatch_get_main_queue(),^{__block BOOL started=NO;[NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification*n){if(started)Validate();}];[NSTimer scheduledTimerWithTimeInterval:.20 repeats:YES block:^(NSTimer*t){if(IntroDone()){started=YES;[t invalidate];Validate();[NSTimer scheduledTimerWithTimeInterval:45 repeats:YES block:^(NSTimer*s){Validate();}];}}];});}
+void ActivationFillExpiryParts(void *result){if(!result)return;memset(result,0,40);if(!ActivationAccessActive()||!Account)return;NSTimeInterval remaining=atomic_load(&ExpirationUptime)-Uptime();uint64_t t=remaining>0?(uint64_t)remaining:0;*((uint8_t*)result)=1;uint64_t*p=result;p[1]=t/86400;p[2]=(t%86400)/3600;p[3]=(t%3600)/60;p[4]=t%60;}
+void ActivationSyncUsername(void *target,void(*assign)(void*,const char*,size_t)){@autoreleasepool{if(!target||!assign||!ActivationAccessActive())return;NSString*name=Account[@"name"];if(![name isKindOfClass:NSString.class])return;const char*s=name.UTF8String;if(s)assign(target,s,strlen(s));}}
+static void Validate(void){
+ if(!IntroDone()||Validating||Activating||Uptime()<NextValidation)return;
+ if(!SessionToken.length){Granted=NO;Present(NO);NextValidation=Uptime()+5;return;}
+ Validating=YES;unsigned generation=SessionGeneration;
+ API(@"/api/account",nil,^(NSDictionary*j,NSString*error,NSInteger status){
+  Validating=NO;if(generation!=SessionGeneration)return;InitialValidationFinished=YES;
+  NextValidation=Uptime()+45;
+  if(status==401||status==403){Granted=NO;SessionToken=nil;WriteSecret(@"session",nil);Present(NO);return;}
+  NSDictionary *account=[j[@"account"]isKindOfClass:NSDictionary.class]?j[@"account"]:nil;
+  if(error||!account){NextValidation=Uptime()+10;if(!ActivationAccessActive()){Granted=NO;Present(NO);}return;}
+  if(AcceptAccount(account))DismissLogin();else Present(NO);
+ });
+}
+__attribute__((constructor))static void StartActivation(void){dispatch_async(dispatch_get_main_queue(),^{
+ SessionToken=ReadSecret(@"session");
+ [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification*n){(void)n;Validate();}];
+ [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer*t){(void)t;if(!IntroDone())return;if(Granted&&!ActivationAccessActive())Granted=NO;if(!Granted&&!Validating&&!Activating&&(InitialValidationFinished||!SessionToken.length))Present(NO);Validate();}];
+});}
