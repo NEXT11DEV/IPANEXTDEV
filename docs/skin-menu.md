@@ -37,4 +37,6 @@ Revision 3 adds TopBarUserProfileButton.updateUserLeagueStarForLeague:withLevel:
 
 Cue appearance now substitutes an already-observed CueWidget sprite-definition object through setupWithCueSpriteDefinition:productId:cueLevel:forceSpriteDef:, preserving the original product ID and cue level. Own/opponent render scope is tracked so an opponent render clears the local cue marker. The catalog still contains observed definitions only; a gallery with a single current cue does not supply a different appearance.
 
-The menu's UIKit layout is forced left-to-right to match the reference's star/slider/tab order. A developer button inside Skins opens https://t.me/YG8_1. Additional diagnostic fields show lobby/definition hook installation and appearance-application counts. Revision 3 has not yet been tested on an iPhone.
+The menu's UIKit layout is forced left-to-right to match the reference's star/slider/tab order. The existing Telegram icon on the activation screen and a developer button inside the original Account tab open https://t.me/YG8_1. The developer button is not inside Skins. Additional diagnostic fields show lobby/definition hook installation and appearance-application counts. Revision 3 has not yet been tested on an iPhone.
+
+Revision 3 also marks the lobby profile avatar through its verified _playerAvatar object ivar, so local avatar/frame refresh can cover the lobby. It skips cue refresh while the opponent cue is active. ActivationKit API origin and framework bytes remain unchanged: only the Telegram control target is rewired at runtime.

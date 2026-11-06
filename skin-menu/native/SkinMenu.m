@@ -15,7 +15,7 @@
 
 static NSObject *Lock;
 static _Atomic int LevelOn,LevelValue,LeagueValue,CueValue,FrameValue,AvatarValue;
-static _Atomic bool Dirty;
+static _Atomic bool Dirty,CueCurrentlyOpponent;
 static _Atomic unsigned CueCalls,StarCalls,HUDCalls,FrameCalls,AvatarCalls,DrawCalls,OffMainCalls;
 static _Atomic bool LocalHUDFound;
 static NSMutableDictionary *CueImages,*FrameImages,*AvatarImages,*CueDefinitions;
@@ -25,6 +25,7 @@ static _Thread_local unsigned LocalCueDepth;
 static _Thread_local int CueRenderScope;
 static _Atomic unsigned LobbyCalls,CueAppearanceApplied;
 static void (*OldLobby)(id,SEL,id,id);
+static void (*OldLobbyAvatar)(id,SEL),(*OldLobbyFrame)(id,SEL);
 static void (*OldCueDefinition)(id,SEL,id,int,int,BOOL);
 static int NativeLocalSide(id hud);
 static NSMutableSet *CueIDs,*FrameIDs,*AvatarIDs,*PendingImages;
@@ -96,7 +97,7 @@ static id NewLocal(id self,SEL cmd) {
 }
 static void NewCue(id self,SEL cmd,int cue,int level,BOOL opponent) {
     atomic_fetch_add(&CueCalls,1);if(!NSThread.isMainThread)atomic_fetch_add(&OffMainCalls,1);
-    int previousScope=CueRenderScope;CueRenderScope=opponent?-1:1;
+    atomic_store(&CueCurrentlyOpponent,opponent);int previousScope=CueRenderScope;CueRenderScope=opponent?-1:1;
     if(!opponent){@synchronized(Lock){LastCue=self;OriginalCueID=cue;OriginalCueLevel=level;}LocalCueDepth++;}
     OldCue(self,cmd,cue,level,opponent);
     if(!opponent)LocalCueDepth--;CueRenderScope=previousScope;
@@ -110,9 +111,12 @@ static void NewCueDefinition(id self,SEL cmd,id definition,int product,int level
     OldCueDefinition(self,cmd,apply?replacement:definition,product,level,apply?YES:force);
     if(apply)atomic_fetch_add(&CueAppearanceApplied,1);else Observe(0,product,ObjectCall(self,"getCueSprite"));
 }
+static void MarkLobbyAvatar(id self){Ivar field=class_getInstanceVariable(object_getClass(self),"_playerAvatar");const char *type=field?ivar_getTypeEncoding(field):NULL;if(type&&type[0]=='@')MarkAvatar(object_getIvar(self,field));}
+static void NewLobbyAvatar(id self,SEL cmd){OldLobbyAvatar(self,cmd);MarkLobbyAvatar(self);}
+static void NewLobbyFrame(id self,SEL cmd){OldLobbyFrame(self,cmd);MarkLobbyAvatar(self);}
 static void NewLobby(id self,SEL cmd,id league,id level){
     atomic_fetch_add(&LobbyCalls,1);objc_setAssociatedObject(self,&LobbyArgsKey,@[league?:NSNull.null,level?:NSNull.null],OBJC_ASSOCIATION_RETAIN_NONATOMIC);@synchronized(Lock){LastLobby=self;}
-    BOOL on=Access()&&atomic_load(&LevelOn);OldLobby(self,cmd,on?@(atomic_load(&LeagueValue)):league,on?@(atomic_load(&LevelValue)):level);
+    BOOL on=Access()&&atomic_load(&LevelOn);OldLobby(self,cmd,on?@(atomic_load(&LeagueValue)):league,on?@(atomic_load(&LevelValue)):level);MarkLobbyAvatar(self);
 }
 static void HUDStar(id self,SEL cmd,unsigned league,unsigned level,int side) {
     atomic_fetch_add(&HUDCalls,1);objc_setAssociatedObject(self,side==1?&HUD1ArgsKey:&HUD2ArgsKey,@[@(league),@(level)],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -159,7 +163,7 @@ static void RefreshOnRenderThread(void) {
         // The installed original selector may be the alternate spelling on another build.
         (side==1?OldHUD1:OldHUD2)(hud,selector,on?(unsigned)atomic_load(&LeagueValue):[hp[0] unsignedIntValue],on?(unsigned)atomic_load(&LevelValue):[hp[1] unsignedIntValue]);
     }
-    if(cue&&OldCue){int previousScope=CueRenderScope;CueRenderScope=1;LocalCueDepth++;OldCue(cue,sel_registerName("setCueWidgetWithCueId:cueLevel:forOpponent:"),cueID,cueLevel,NO);LocalCueDepth--;CueRenderScope=previousScope;}
+    if(cue&&OldCue&&!atomic_load(&CueCurrentlyOpponent)){int previousScope=CueRenderScope;CueRenderScope=1;LocalCueDepth++;OldCue(cue,sel_registerName("setCueWidgetWithCueId:cueLevel:forOpponent:"),cueID,cueLevel,NO);LocalCueDepth--;CueRenderScope=previousScope;}
     NSArray *fp=avatar?objc_getAssociatedObject(avatar,&FrameArgsKey):nil;
     if(avatar&&fp.count==3&&OldFrame){int selected=atomic_load(&FrameValue);OldFrame(avatar,sel_registerName("loadAvatarFrameWithProductId:fallbackRank:andShouldUseShader:"),access&&Known(1,selected)?(unsigned)selected:[fp[0] unsignedIntValue],[fp[1] unsignedIntValue],[fp[2] boolValue]);}
     NSNumber *ap=avatar?objc_getAssociatedObject(avatar,&AvatarArgsKey):nil;
@@ -242,6 +246,8 @@ static void InstallHooks(void){
     BOOL local=star&&Install("MatchScreenPlayerWidget","createLocalPlayerWidget",YES,(IMP)NewLocal,(IMP *)&OldLocalFactory,"@",factory,2);
     const char *definitionArgs[]={"@",":","@","i","i","B"},*lobbyArgs[]={"@",":","@","@"};
     BOOL definitionOK=Install("CueWidget","setupWithCueSpriteDefinition:productId:cueLevel:forceSpriteDef:",NO,(IMP)NewCueDefinition,(IMP *)&OldCueDefinition,"v",definitionArgs,6);
+    Install("TopBarUserProfileButton","updateUserAvatar",NO,(IMP)NewLobbyAvatar,(IMP *)&OldLobbyAvatar,"v",factory,2);
+    Install("TopBarUserProfileButton","updateAvatarFrame",NO,(IMP)NewLobbyFrame,(IMP *)&OldLobbyFrame,"v",factory,2);
     BOOL lobbyOK=Install("TopBarUserProfileButton","updateUserLeagueStarForLeague:withLevel:",NO,(IMP)NewLobby,(IMP *)&OldLobby,"v",lobbyArgs,4);
     BOOL cueOK=Install("VisualCue","setCueWidgetWithCueId:cueLevel:forOpponent:",NO,(IMP)NewCue,(IMP *)&OldCue,"v",cue,5);
     Install("CueWidget","setupWithCueId:cueLevel:",NO,(IMP)NewCueSetup,(IMP *)&OldCueSetup,"v",pair,4);
@@ -318,7 +324,7 @@ static void Export(void){
         self.galleryTitle=[self label:@"Cue Skin" color:Cyan() size:16];[self.body addSubview:self.galleryTitle];self.note=[self label:@"اعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا." color:[UIColor colorWithWhite:.7 alpha:1] size:12];self.note.numberOfLines=0;[self.body addSubview:self.note];self.tiles=[NSMutableArray array];
         self.restoreButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.restoreButton setTitle:@"إرجاع المظهر الأصلي" forState:UIControlStateNormal];self.restoreButton.tintColor=Cyan();[self.restoreButton addTarget:self action:@selector(restore) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:self.restoreButton];
         self.reportButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.reportButton setTitle:@"مشاركة تقرير المشكلة" forState:UIControlStateNormal];self.reportButton.tintColor=Cyan();[self.reportButton addTarget:self action:@selector(report) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:self.reportButton];
-        self.developerButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.developerButton setTitle:@"✈ المطور · @YG8_1" forState:UIControlStateNormal];self.developerButton.tintColor=Cyan();[self.developerButton addTarget:self action:@selector(developer) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:self.developerButton];
+        self.developerButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.developerButton setTitle:@"✈ المطور · @YG8_1" forState:UIControlStateNormal];self.developerButton.tintColor=Cyan();[self.developerButton addTarget:self action:@selector(developer) forControlEvents:UIControlEventTouchUpInside];[self addSubview:self.developerButton];self.developerButton.hidden=YES;self.developerButton.backgroundColor=Dark();self.developerButton.layer.cornerRadius=12;self.developerButton.titleLabel.font=[UIFont systemFontOfSize:12];
         self.kind=0;self.revision=NSUIntegerMax;self.body.hidden=YES;
     }return self;
 }
@@ -365,7 +371,7 @@ static void Export(void){
     y+=ceil(self.tiles.count/3.0)*(tileH+gap)+8;
     NSString *status=Access()?@"تغييرات المظهر محلية. الصور من العناصر التي عُرضت على الجهاز.":@"التفعيل غير نشط؛ الخيارات لن تُطبّق حتى تفعيل الاشتراك.";
     self.note.text=[status stringByAppendingString:@"\nاعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
-    self.restoreButton.frame=CGRectMake(pad,y,inside/2,36);self.reportButton.frame=CGRectMake(pad+inside/2,y,inside/2,36);y+=40;self.developerButton.frame=CGRectMake(pad,y,inside,38);y+=44;self.body.contentSize=CGSizeMake(width,y);
+    self.restoreButton.frame=CGRectMake(pad,y,inside/2,36);self.reportButton.frame=CGRectMake(pad+inside/2,y,inside/2,36);y+=46;self.body.contentSize=CGSizeMake(width,y);
 }
 - (void)tick {
     FindNinja();InstallHooks();UIWindow *w=Window();if(!w||!NinjaVerified){self.hidden=YES;return;}
@@ -375,16 +381,34 @@ static void Export(void){
     MenuRect (*panel)(void)=(MenuRect(*)(void))(NinjaBase+0x9db40),(*content)(void)=(MenuRect(*)(void))(NinjaBase+0xa66b8);
     CGRect p=Convert(panel(),w),c=Convert(content(),w);if(!isfinite(p.origin.x)||!isfinite(c.origin.y)||p.size.width<100||p.size.height<100){self.hidden=YES;return;}
     CGFloat header=MAX(42,MIN(p.size.height*.30,c.origin.y-p.origin.y-3));self.bar.frame=CGRectMake(p.origin.x+6,p.origin.y+2,MAX(100,p.size.width-42),header-2);
-    CGRect bodyRect=CGRectIntersection(CGRectMake(p.origin.x+5,p.origin.y+header,p.size.width-10,p.size.height-header-5),w.bounds);if(CGRectIsNull(bodyRect)||bodyRect.size.height<20){self.hidden=YES;return;}self.body.frame=bodyRect;self.body.hidden=!self.skins;[w bringSubviewToFront:self];
+    CGRect bodyRect=CGRectIntersection(CGRectMake(p.origin.x+5,p.origin.y+header,p.size.width-10,p.size.height-header-5),w.bounds);if(CGRectIsNull(bodyRect)||bodyRect.size.height<20){self.hidden=YES;return;}self.body.frame=bodyRect;self.body.hidden=!self.skins;BOOL account=*(volatile int *)(NinjaBase+0x1113fc)==3&&!self.skins;self.developerButton.hidden=!account;self.developerButton.frame=CGRectMake(CGRectGetMaxX(bodyRect)-166,bodyRect.origin.y+5,156,28);[w bringSubviewToFront:self];
     self.ticks++;if(self.ticks%8==0&&self.skins)[self rebuild];[self setNeedsLayout];
 }
 @end
+@interface SkinDeveloperLink : NSObject
++ (void)open;
+@end
+@implementation SkinDeveloperLink
++ (void)open {[UIApplication.sharedApplication openURL:[NSURL URLWithString:@"https://t.me/YG8_1"] options:@{} completionHandler:nil];}
+@end
+static char DeveloperWired;
+static void WireLoginDeveloper(void){
+    Class panel=objc_getClass("ActivationPanel");if(!panel)return;
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes){
+        if(![scene isKindOfClass:UIWindowScene.class]||scene.activationState!=UISceneActivationStateForegroundActive)continue;
+        for(UIWindow *window in ((UIWindowScene *)scene).windows){
+            UIViewController *root=window.rootViewController;if(window.hidden||![root isKindOfClass:panel])continue;
+            id control=ObjectCall(root,"telegram");if(![control isKindOfClass:UIButton.class]||objc_getAssociatedObject(control,&DeveloperWired))continue;
+            UIButton *button=control;[button removeTarget:root action:sel_registerName("openWebsite") forControlEvents:UIControlEventTouchUpInside];[button addTarget:SkinDeveloperLink.class action:@selector(open) forControlEvents:UIControlEventTouchUpInside];button.accessibilityLabel=@"المطور @YG8_1";objc_setAssociatedObject(button,&DeveloperWired,@YES,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+}
 static SkinMenuView *Menu;
 @interface SkinMenuClock : NSObject
 + (void)tick:(CADisplayLink *)link;
 @end
 @implementation SkinMenuClock
-+ (void)tick:(CADisplayLink *)link {(void)link;[Menu tick];}
++ (void)tick:(CADisplayLink *)link {(void)link;WireLoginDeveloper();[Menu tick];}
 @end
 __attribute__((constructor)) static void Start(void){dispatch_async(dispatch_get_main_queue(),^{
     Lock=[NSObject new];CueDefinitions=[NSMutableDictionary dictionary];CueImages=[NSMutableDictionary dictionary];FrameImages=[NSMutableDictionary dictionary];AvatarImages=[NSMutableDictionary dictionary];CueIDs=[NSMutableSet set];FrameIDs=[NSMutableSet set];AvatarIDs=[NSMutableSet set];PendingImages=[NSMutableSet set];CaptureQueue=[NSMutableArray array];
