@@ -1,0 +1,21 @@
+name: SkinMenu integrated trial
+on:
+  push:
+    branches: [activation-kit-ios-20261105]
+    paths: ['skin-menu/**', '.github/workflows/skin-menu.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile cosmetic trial
+        working-directory: skin-menu
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SkinMenu-unsigned
+          path: skin-menu/out/SkinMenu.framework
+          retention-days: 1
