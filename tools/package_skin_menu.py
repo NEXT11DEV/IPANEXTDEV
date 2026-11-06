@@ -4,7 +4,7 @@ import copy,hashlib,json,struct,zipfile
 root=Path(__file__).resolve().parent.parent
 source=root/'upload/8BallPool-ActivationKit-landscape-test-needs-signing.ipa'
 artifact=root/'output/SkinMenu-unsigned.zip'
-out=root/'output/8BallPool-SkinMenu-integrated-trial-needs-signing.ipa'
+out=root/'output/8BallPool-SkinMenu-v3-needs-signing.ipa'
 with zipfile.ZipFile(source) as original,zipfile.ZipFile(artifact) as framework:
     main='Payload/pool.app/pool'
     raw=original.read(main)

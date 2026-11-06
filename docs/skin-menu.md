@@ -28,3 +28,13 @@ On a Mac with Xcode: `bash build.sh`. The intended GitHub Actions workflow is in
 `package_menu.py` expects the compiled artifact at output/SkinMenu-unsigned.zip, the two original user-attached IPAs under upload/, and copies 11 existing menu/star images from the donor into the new framework privately. No game IPA or image assets are intended for the public repository.
 
 A successful compile and ZIP check would still not prove runtime behavior. The integrated menu, in-match identification, Cocos capture, frame selection, avatar selection, and cue appearance must all be validated on the iPhone before calling this a working port.
+
+## Revision 3
+
+The user's SkinMenu-2 report confirmed active access, a matching engine, working draw callbacks, and all original hook entrypoints being called. It also showed localHUDIdentified=false. Their screenshots demonstrated that the lobby profile star was not covered by the existing hooks.
+
+Revision 3 adds TopBarUserProfileButton.updateUserLeagueStarForLeague:withLevel:, so the local lobby profile can be refreshed on the render thread. In-match identification now asks the game's GameHUD.isPlayer1:/isPlayer2: using GameManager.player, instead of relying solely on identifier-string equality.
+
+Cue appearance now substitutes an already-observed CueWidget sprite-definition object through setupWithCueSpriteDefinition:productId:cueLevel:forceSpriteDef:, preserving the original product ID and cue level. Own/opponent render scope is tracked so an opponent render clears the local cue marker. The catalog still contains observed definitions only; a gallery with a single current cue does not supply a different appearance.
+
+The menu's UIKit layout is forced left-to-right to match the reference's star/slider/tab order. A developer button inside Skins opens https://t.me/YG8_1. Additional diagnostic fields show lobby/definition hook installation and appearance-application counts. Revision 3 has not yet been tested on an iPhone.
