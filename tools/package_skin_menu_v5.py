@@ -24,9 +24,26 @@ with zipfile.ZipFile(source) as original,zipfile.ZipFile('output/SkinMenu-v5.zip
  guards=[]
  for entry,pad,expected,label in [(0x36f24,0x2400,'ffc303d1','AutoPlay.Update'),(0x3b294,0x2500,'ffc303d1','TickAutoQueue'),(0x40330,0x2600,'ef3bb66d','DrawESP')]:
   old=struct.unpack_from('<I',native,entry)[0];assert native[entry:entry+4].hex()==expected
-  assert not any(native[pad:pad+56])
-  words=[0xa9be7bfd,0x910003fd,0x92800020,adrp(1,pad+12,symbol),0x91000021|((symbol&4095)<<10),branch(pad+20,0xd92a4,True),cbz(pad+24,pad+48,True),0xd63f0000,cbz(pad+32,pad+48),0xa8c27bfd,old,branch(pad+44,entry+4),0xa8c27bfd,0xd65f03c0]
-  native[pad:pad+56]=struct.pack('<14I',*words);struct.pack_into('<I',native,entry,branch(entry,pad));guards.append({'function':label,'entry':hex(entry),'guard':hex(pad)})
+  # Preserve all integer/SIMD argument registers across dlsym and access checks.
+  stores=[];loads=[]
+  for r,off in [(0,16),(2,32),(4,48),(6,64),(8,80)]:
+   common=((off//8)<<15)|((r+1)<<10)|(31<<5)|r
+   stores.append(0xa9000000|common);loads.append(0xa9400000|common)
+  for r,off in [(0,96),(2,128),(4,160),(6,192)]:
+   common=((off//16)<<15)|((r+1)<<10)|(31<<5)|r
+   stores.append(0xad000000|common);loads.append(0xad400000|common)
+  words=[0xa9b07bfd,0x910003fd]+stores
+  words += [0x92800020,adrp(1,pad+4*(len(words)+1),symbol),0x91000021|((symbol&4095)<<10)]
+  words.append(branch(pad+4*len(words),0xd92a4,True))
+  missing=len(words);words.append(0)
+  words.append(0xd63f0000)
+  denied=len(words);words.append(0)
+  words += loads+[0xa8d07bfd,old]
+  words.append(branch(pad+4*len(words),entry+4))
+  failure=pad+4*len(words);words += [0xa8d07bfd,0xd65f03c0]
+  words[missing]=cbz(pad+4*missing,failure,True);words[denied]=cbz(pad+4*denied,failure)
+  size=4*len(words);assert size<=256 and not any(native[pad:pad+size])
+  native[pad:pad+size]=struct.pack('<%dI'%len(words),*words);struct.pack_into('<I',native,entry,branch(entry,pad));guards.append({'function':label,'entry':hex(entry),'guard':hex(pad)})
  replacements[engine]=bytes(native)
  with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as result:
   for info in original.infolist():result.writestr(copy.copy(info),replacements.get(info.filename,original.read(info.filename)))
