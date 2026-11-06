@@ -12,14 +12,22 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <CommonCrypto/CommonDigest.h>
 
 static NSObject *Lock;
 static _Atomic int LevelOn,LevelValue,LeagueValue,CueValue,FrameValue,AvatarValue;
-static _Atomic bool Dirty,CueCurrentlyOpponent;
+static _Atomic bool Dirty,CueCurrentlyOpponent,WantThumbnails,DiscoveryRequested;
+static _Atomic bool IntegrityVerified;
+static uintptr_t ActivationTextStart,ActivationTextEnd;
+static _Atomic unsigned OwnMaxMicros,BaseMaxMicros,SlowOwnFrames;
+static NSMapTable *ObservedNodes;
+static void BootstrapStep(void);
 static _Atomic unsigned CueCalls,StarCalls,HUDCalls,FrameCalls,AvatarCalls,DrawCalls,OffMainCalls;
 static _Atomic bool LocalHUDFound;
 static NSMutableDictionary *CueImages,*FrameImages,*AvatarImages,*CueDefinitions;
-static __weak id LastLobby;
+static __weak id LastLobby,LastTrophy;
+static void (*OldTrophy)(id,SEL,id,id);
+static _Atomic unsigned TrophyCalls;
 static char LobbyArgsKey;
 static _Thread_local unsigned LocalCueDepth;
 static _Thread_local int CueRenderScope;
@@ -28,15 +36,17 @@ static __weak id LastCueWidget;
 static char CueRootArgsKey;
 static void (*OldCueRoot)(id,SEL,id,int,BOOL);
 static void ConfigureAccountLinks(void);
-static void BootstrapViews(void);
+
 static _Atomic bool AccountLinksConfigured;
 static void (*OldLobby)(id,SEL,id,id);
 static void (*OldLobbyAvatar)(id,SEL),(*OldLobbyFrame)(id,SEL);
 static void (*OldCueDefinition)(id,SEL,id,int,int,BOOL);
 static int NativeLocalSide(id hud);
-static NSMutableSet *CueIDs,*FrameIDs,*AvatarIDs,*PendingImages;
-static NSMutableArray *CaptureQueue;
-static __weak id LastCue,LastWidget,LastHUD,LastAvatar;
+static NSMutableSet *CueIDs,*FrameIDs,*AvatarIDs;
+
+static __weak id LastCue,LastWidget,LastHUD,LastAvatar,ActualManager;
+static void (*OldManagerCue)(id,SEL);
+static void (*OldManagerStarted)(id,SEL,const void *);
 static int OriginalCueID,OriginalCueLevel,HUDSide;
 static char LocalKey,StarArgsKey,HUD1ArgsKey,HUD2ArgsKey,FrameArgsKey,AvatarArgsKey;
 static _Thread_local unsigned LocalDepth;
@@ -53,7 +63,28 @@ static void (*OldAvatar)(id,SEL,int);
 static uintptr_t NinjaBase;
 static BOOL NinjaVerified;
 static NSString *HookDescription=@"بانتظار تهيئة الربط";
-static BOOL Access(void) { BOOL (*f)(void)=(BOOL(*)(void))dlsym(RTLD_DEFAULT,"ActivationAccessActive");return f&&f(); }
+static BOOL RawAccess(void){
+    BOOL (*active)(void)=(BOOL(*)(void))dlsym(RTLD_DEFAULT,"ActivationAccessActive");uintptr_t address=(uintptr_t)active;
+    return active&&address>=ActivationTextStart&&address<ActivationTextEnd&&active();
+}
+__attribute__((visibility("default"))) BOOL SkinFeatureAccess(void){return atomic_load(&IntegrityVerified)&&RawAccess();}
+static BOOL Access(void){return SkinFeatureAccess();}
+static void VerifyActivation(void){
+    static const unsigned char expected[32]={0xe5,0x31,0x19,0xdb,0x58,0xe3,0x4d,0xf6,0xd9,0x47,0xda,0x58,0xc5,0x9d,0x9d,0x2e,0xbd,0xb4,0x6d,0x76,0xb6,0x73,0x15,0x80,0x96,0xe4,0xef,0x27,0x76,0x1d,0x9c,0x8a};
+    for(uint32_t i=0;i<_dyld_image_count();i++){
+        const char *name=_dyld_get_image_name(i);if(!name||!strstr(name,"/ActivationKit.framework/ActivationKit"))continue;
+        const struct mach_header_64 *h=(const struct mach_header_64 *)_dyld_get_image_header(i);if(h->magic!=MH_MAGIC_64)continue;
+        const uint8_t *p=(const uint8_t *)h+sizeof(*h);
+        for(uint32_t j=0;j<h->ncmds;j++){const struct load_command *cmd=(const struct load_command *)p;
+            if(cmd->cmd==LC_SEGMENT_64){const struct segment_command_64 *seg=(const struct segment_command_64 *)p;const struct section_64 *sections=(const struct section_64 *)(seg+1);
+                for(uint32_t k=0;k<seg->nsects;k++){const struct section_64 *section=&sections[k];if(strncmp(section->sectname,"__text",16)||section->size!=33300)continue;
+                    const unsigned char *code=(const unsigned char *)h+section->addr;unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(code,(CC_LONG)section->size,digest);
+                    if(!memcmp(digest,expected,32)){ActivationTextStart=(uintptr_t)code;ActivationTextEnd=ActivationTextStart+section->size;atomic_store(&IntegrityVerified,true);}return;
+                }
+            }p+=cmd->cmdsize;
+        }
+    }
+}
 static BOOL Local(id node) {
     for(int i=0;i<10 && node;i++) {
         if([objc_getAssociatedObject(node,&LocalKey) boolValue]) return YES;
@@ -77,15 +108,9 @@ static BOOL OwnID(id playerID,id offlineID) {
 static NSMutableSet *IDs(int kind) { return kind==0?CueIDs:kind==1?FrameIDs:AvatarIDs; }
 static NSMutableDictionary *Images(int kind) { return kind==0?CueImages:kind==1?FrameImages:AvatarImages; }
 static BOOL Known(int kind,int value) { if(value<0)return NO;@synchronized(Lock){return [IDs(kind) containsObject:@(value)];} }
-static void Observe(int kind,int value,id node) {
-    if(value<0||value>10000000||!node)return;
-    NSString *key=[NSString stringWithFormat:@"%d:%d",kind,value];
-    @synchronized(Lock) {
-        [IDs(kind) addObject:@(value)];
-        if(!Images(kind)[@(value)]&&![PendingImages containsObject:key]&&CaptureQueue.count<48) {
-            [PendingImages addObject:key];[CaptureQueue addObject:@{@"kind":@(kind),@"id":@(value),@"node":node,@"key":key}];
-        }
-    }
+static void Observe(int kind,int value,id node){
+    if(value<0||value>10000000||!node)return;NSString *key=[NSString stringWithFormat:@"%d:%d",kind,value];
+    @synchronized(Lock){[IDs(kind) addObject:@(value)];[ObservedNodes setObject:node forKey:key];}
 }
 static void MarkAvatar(id avatar) { if(avatar){objc_setAssociatedObject(avatar,&LocalKey,@YES,OBJC_ASSOCIATION_RETAIN_NONATOMIC);@synchronized(Lock){LastAvatar=avatar;}atomic_store(&Dirty,true);} }
 static void NewStar(id self,SEL cmd,int league,int level) {
@@ -123,10 +148,13 @@ static void NewCueRoot(id self,SEL cmd,id definition,int product,BOOL force){
 static void MarkLobbyAvatar(id self){Ivar field=class_getInstanceVariable(object_getClass(self),"_playerAvatar");const char *type=field?ivar_getTypeEncoding(field):NULL;if(type&&type[0]=='@')MarkAvatar(object_getIvar(self,field));}
 static void NewLobbyAvatar(id self,SEL cmd){OldLobbyAvatar(self,cmd);MarkLobbyAvatar(self);}
 static void NewLobbyFrame(id self,SEL cmd){OldLobbyFrame(self,cmd);MarkLobbyAvatar(self);}
-static void NewLobby(id self,SEL cmd,id league,id level){
-    atomic_fetch_add(&LobbyCalls,1);objc_setAssociatedObject(self,&LobbyArgsKey,@[league?:NSNull.null,level?:NSNull.null],OBJC_ASSOCIATION_RETAIN_NONATOMIC);@synchronized(Lock){LastLobby=self;}
-    BOOL on=Access()&&atomic_load(&LevelOn);OldLobby(self,cmd,on?@(atomic_load(&LeagueValue)):league,on?@(atomic_load(&LevelValue)):level);MarkLobbyAvatar(self);
+static void UpdateLobbyView(id self,SEL cmd,id league,id level,BOOL trophy){
+    if(trophy)atomic_fetch_add(&TrophyCalls,1);else atomic_fetch_add(&LobbyCalls,1);
+    objc_setAssociatedObject(self,&LobbyArgsKey,@[league?:NSNull.null,level?:NSNull.null],OBJC_ASSOCIATION_RETAIN_NONATOMIC);@synchronized(Lock){if(trophy)LastTrophy=self;else LastLobby=self;}
+    BOOL on=Access()&&atomic_load(&LevelOn);(trophy?OldTrophy:OldLobby)(self,cmd,on?@(atomic_load(&LeagueValue)):league,on?@(atomic_load(&LevelValue)):level);MarkLobbyAvatar(self);
 }
+static void NewLobby(id self,SEL cmd,id league,id level){UpdateLobbyView(self,cmd,league,level,NO);}
+static void NewTrophy(id self,SEL cmd,id league,id level){UpdateLobbyView(self,cmd,league,level,YES);}
 static void HUDStar(id self,SEL cmd,unsigned league,unsigned level,int side) {
     atomic_fetch_add(&HUDCalls,1);objc_setAssociatedObject(self,side==1?&HUD1ArgsKey:&HUD2ArgsKey,@[@(league),@(level)],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     int nativeSide=NativeLocalSide(self);BOOL local=NO;@synchronized(Lock){if(LastHUD!=self){HUDSide=0;atomic_store(&LocalHUDFound,false);}LastHUD=self;if(nativeSide){HUDSide=nativeSide;atomic_store(&LocalHUDFound,true);}local=HUDSide==side;}
@@ -159,11 +187,13 @@ static void NewAvatar(id self,SEL cmd,int avatar) {
 static void RefreshOnRenderThread(void) {
     id candidate=nil;@synchronized(Lock){candidate=LastHUD;}if(candidate){int inferred=NativeLocalSide(candidate);if(inferred){@synchronized(Lock){if(HUDSide!=inferred)atomic_store(&Dirty,true);HUDSide=inferred;}atomic_store(&LocalHUDFound,true);}}
     if(!atomic_exchange(&Dirty,false))return;
-    id cue,widget,hud,avatar,lobby,cueWidget;int cueID,cueLevel,side;
-    @synchronized(Lock){cue=LastCue;widget=LastWidget;hud=LastHUD;avatar=LastAvatar;lobby=LastLobby;cueWidget=LastCueWidget;cueID=OriginalCueID;cueLevel=OriginalCueLevel;side=HUDSide;}
+    id cue,widget,hud,avatar,lobby,trophy,cueWidget;int cueID,cueLevel,side;
+    @synchronized(Lock){cue=LastCue;widget=LastWidget;hud=LastHUD;avatar=LastAvatar;lobby=LastLobby;trophy=LastTrophy;cueWidget=LastCueWidget;cueID=OriginalCueID;cueLevel=OriginalCueLevel;side=HUDSide;}
     BOOL access=Access(),on=access&&atomic_load(&LevelOn);
     NSArray *lp=lobby?objc_getAssociatedObject(lobby,&LobbyArgsKey):nil;
     if(lobby&&lp.count==2&&OldLobby)OldLobby(lobby,sel_registerName("updateUserLeagueStarForLeague:withLevel:"),on?@(atomic_load(&LeagueValue)):(lp[0]==NSNull.null?nil:lp[0]),on?@(atomic_load(&LevelValue)):(lp[1]==NSNull.null?nil:lp[1]));
+    NSArray *tp=trophy?objc_getAssociatedObject(trophy,&LobbyArgsKey):nil;
+    if(trophy&&tp.count==2&&OldTrophy)OldTrophy(trophy,sel_registerName("updateUserLeagueStarForLeague:withLevel:"),on?@(atomic_load(&LeagueValue)):(tp[0]==NSNull.null?nil:tp[0]),on?@(atomic_load(&LevelValue)):(tp[1]==NSNull.null?nil:tp[1]));
     NSArray *star=widget?objc_getAssociatedObject(widget,&StarArgsKey):nil;
     if(widget&&star.count==2&&OldStar)OldStar(widget,sel_registerName("setupStarWithLeague:andLevel:"),on?atomic_load(&LeagueValue):[star[0] intValue],on?atomic_load(&LevelValue):[star[1] intValue]);
     NSArray *hp=hud?objc_getAssociatedObject(hud,side==1?&HUD1ArgsKey:&HUD2ArgsKey):nil;
@@ -195,10 +225,15 @@ static BOOL Args(Method m,const char *ret,const char **args,unsigned count){
     if(!m||method_getNumberOfArguments(m)!=count)return NO;char *t=method_copyReturnType(m);BOOL ok=t&&strcmp(t,ret)==0;free(t);
     for(unsigned i=0;i<count&&ok;i++){t=method_copyArgumentType(m,i);ok=t&&strcmp(t,args[i])==0;free(t);}return ok;
 }
+static id FieldObject(id object,const char *name){if(!object)return nil;Ivar ivar=class_getInstanceVariable(object_getClass(object),name);const char *type=ivar?ivar_getTypeEncoding(ivar):NULL;return type&&type[0]=='@'?object_getIvar(object,ivar):nil;}
+static void NewManagerCue(id self,SEL cmd){@synchronized(Lock){ActualManager=self;}OldManagerCue(self,cmd);}
+static void NewManagerStarted(id self,SEL cmd,const void *event){@synchronized(Lock){ActualManager=self;}OldManagerStarted(self,cmd,event);}
 static int NativeLocalSide(id hud){
-    id manager=ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),player=ObjectCall(manager,"player");if(!hud||!player)return 0;
+    id manager=nil;@synchronized(Lock){manager=ActualManager;}if(!manager)manager=ObjectCall(objc_getClass("GameManager"),"sharedGameManager");
+    id player=ObjectCall(manager,"player");if(!player)player=FieldObject(manager,"mPlayer");if(!hud||!player)return 0;
     const char *args[]={"@",":","@"};const char *names[]={"isPlayer1:","isPlayer2:"};
-    for(int i=0;i<2;i++){SEL sel=sel_registerName(names[i]);Method m=class_getInstanceMethod(object_getClass(hud),sel);if(Args(m,"B",args,3)&&((BOOL(*)(id,SEL,id))objc_msgSend)(hud,sel,player))return i+1;}return 0;
+    for(int i=0;i<2;i++){SEL sel=sel_registerName(names[i]);Method m=class_getInstanceMethod(object_getClass(hud),sel);if(Args(m,"B",args,3)&&((BOOL(*)(id,SEL,id))objc_msgSend)(hud,sel,player))return i+1;}
+    id localID=FieldObject(player,"mId");for(int side=1;side<=2;side++){id slot=FieldObject(hud,side==1?"_player1":"_player2");if(slot==player)return side;id otherID=FieldObject(slot,"mId");if([localID isKindOfClass:NSString.class]&&[(NSString *)localID length]&&[localID isEqual:otherID])return side;}return 0;
 }
 static BOOL Install(const char *cn,const char *mn,BOOL meta,IMP replacement,IMP *old,const char *ret,const char **args,unsigned n){
     if(*old)return YES;Class cls=objc_getClass(cn);if(!cls)return NO;if(meta)cls=object_getClass(cls);SEL sel=sel_registerName(mn);Method m=class_getInstanceMethod(cls,sel);if(!Args(m,ret,args,n))return NO;
@@ -248,13 +283,30 @@ static UIImage *Snapshot(id node){
     return image;
 }
 static void ProcessCapture(void){
-    NSDictionary *job=nil;@synchronized(Lock){if(CaptureQueue.count){job=CaptureQueue.firstObject;[CaptureQueue removeObjectAtIndex:0];}}
-    if(!job)return;UIImage *image=Snapshot(job[@"node"]);@synchronized(Lock){[PendingImages removeObject:job[@"key"]];if(image)Images([job[@"kind"] intValue])[job[@"id"]]=image;}
+    if(!atomic_load(&WantThumbnails))return;
+    @synchronized(Lock){if(LastHUD||LastCue)return;}
+    NSDictionary *job=nil;
+    @synchronized(Lock){
+        for(int kind=0;kind<3&&!job;kind++)for(NSNumber *value in IDs(kind)){
+            if(Images(kind)[value])continue;NSString *key=[NSString stringWithFormat:@"%d:%@",kind,value];id node=[ObservedNodes objectForKey:key];
+            if(node){job=@{@"kind":@(kind),@"id":value,@"node":node};break;}
+        }
+    }
+    if(!job)return;UIImage *image=Snapshot(job[@"node"]);if(image)@synchronized(Lock){Images([job[@"kind"] intValue])[job[@"id"]]=image;}
 }
-static void NewDraw(id self,SEL cmd){unsigned frame=atomic_fetch_add(&DrawCalls,1);@autoreleasepool{ConfigureAccountLinks();if(frame%30==0)BootstrapViews();RefreshOnRenderThread();ProcessCapture();}OldDraw(self,cmd);}
+static void MaxCounter(_Atomic unsigned *counter,unsigned value){unsigned old=atomic_load(counter);while(value>old&&!atomic_compare_exchange_weak(counter,&old,value)){};}
+static void NewDraw(id self,SEL cmd){
+    unsigned frame=atomic_fetch_add(&DrawCalls,1);CFAbsoluteTime start=CFAbsoluteTimeGetCurrent();
+    @autoreleasepool{ConfigureAccountLinks();BootstrapStep();RefreshOnRenderThread();if(frame%30==0)ProcessCapture();}
+    CFAbsoluteTime after=CFAbsoluteTimeGetCurrent();unsigned own=(unsigned)MAX(0,(after-start)*1000000);MaxCounter(&OwnMaxMicros,own);if(own>50000)atomic_fetch_add(&SlowOwnFrames,1);
+    OldDraw(self,cmd);MaxCounter(&BaseMaxMicros,(unsigned)MAX(0,(CFAbsoluteTimeGetCurrent()-after)*1000000));
+}
 static void InstallHooks(void){
     static BOOL complete;if(complete)return;
     const char *factory[]={"@",":"},*pair[]={"@",":","i","i"},*cue[]={"@",":","i","i","B"},*hud[]={"@",":","I","I"},*slot[]={"@",":","@","@","i","I"},*allAvatar[]={"@",":","@","i","@","@","i","I"},*frame[]={"@",":","I","I","B"},*avatar[]={"@",":","i"};
+    const char *eventArgs[]={"@",":","r^v"};
+    Install("GameManager","setActiveVisualCue",NO,(IMP)NewManagerCue,(IMP *)&OldManagerCue,"v",factory,2);
+    Install("GameManager","networkEventGameStarted:",NO,(IMP)NewManagerStarted,(IMP *)&OldManagerStarted,"v",eventArgs,3);
     BOOL star=Install("MatchScreenPlayerWidget","setupStarWithLeague:andLevel:",NO,(IMP)NewStar,(IMP *)&OldStar,"v",pair,4);
     BOOL local=star&&Install("MatchScreenPlayerWidget","createLocalPlayerWidget",YES,(IMP)NewLocal,(IMP *)&OldLocalFactory,"@",factory,2);
     const char *definitionArgs[]={"@",":","@","i","i","B"},*lobbyArgs[]={"@",":","@","@"};
@@ -263,6 +315,7 @@ static void InstallHooks(void){
     BOOL definitionOK=Install("CueWidget","setupWithCueSpriteDefinition:productId:cueLevel:forceSpriteDef:",NO,(IMP)NewCueDefinition,(IMP *)&OldCueDefinition,"v",definitionArgs,6);
     Install("TopBarUserProfileButton","updateUserAvatar",NO,(IMP)NewLobbyAvatar,(IMP *)&OldLobbyAvatar,"v",factory,2);
     Install("TopBarUserProfileButton","updateAvatarFrame",NO,(IMP)NewLobbyFrame,(IMP *)&OldLobbyFrame,"v",factory,2);
+    BOOL trophyOK=Install("TopBarTrophyButton","updateUserLeagueStarForLeague:withLevel:",NO,(IMP)NewTrophy,(IMP *)&OldTrophy,"v",lobbyArgs,4);
     BOOL lobbyOK=Install("TopBarUserProfileButton","updateUserLeagueStarForLeague:withLevel:",NO,(IMP)NewLobby,(IMP *)&OldLobby,"v",lobbyArgs,4);
     BOOL cueOK=Install("VisualCue","setCueWidgetWithCueId:cueLevel:forOpponent:",NO,(IMP)NewCue,(IMP *)&OldCue,"v",cue,5);
     Install("CueWidget","setupWithCueId:cueLevel:",NO,(IMP)NewCueSetup,(IMP *)&OldCueSetup,"v",pair,4);
@@ -275,7 +328,7 @@ static void InstallHooks(void){
     BOOL avatarOK=Install("PlayerAvatar","loadWithAvatarID:",NO,(IMP)NewAvatar,(IMP *)&OldAvatar,"v",avatar,3);
     BOOL draw=Install("CCDirector","drawScene",NO,(IMP)NewDraw,(IMP *)&OldDraw,"v",factory,2);
     HookDescription=[NSString stringWithFormat:@"الرسم %@ • العصا %@ • النجمة %@ • الإطار %@ • الصورة %@",draw?@"✓":@"—",cueOK?@"✓":@"—",(h1&&h2&&local)?@"✓":@"—",frameOK?@"✓":@"—",avatarOK?@"✓":@"—"];
-    complete=draw&&cueOK&&rootOK&&definitionOK&&lobbyOK&&h1&&h2&&local&&frameOK&&avatarOK&&OldSlot1&&OldSlot2&&OldHUDAllAvatar;
+    complete=draw&&cueOK&&rootOK&&definitionOK&&lobbyOK&&trophyOK&&h1&&h2&&local&&frameOK&&avatarOK&&OldSlot1&&OldSlot2&&OldHUDAllAvatar;
 }
 static UIWindow *Window(void){UIWindow *best=nil;for(UIScene *s in UIApplication.sharedApplication.connectedScenes){if(![s isKindOfClass:UIWindowScene.class]||s.activationState!=UISceneActivationStateForegroundActive)continue;for(UIWindow *w in ((UIWindowScene *)s).windows)if(!w.hidden&&w.alpha>.1&&w.rootViewController&&(!best||w.windowLevel>best.windowLevel||(w.windowLevel==best.windowLevel&&w.isKeyWindow)))best=w;}return best;}
 static UIViewController *Top(void){UIViewController *v=Window().rootViewController;while(v.presentedViewController&&!v.presentedViewController.isBeingDismissed)v=v.presentedViewController;return v;}
@@ -297,25 +350,27 @@ static void ConfigureAccountLinks(void){
     void *(*assign)(void*,const char*,size_t)=(void *(*)(void*,const char*,size_t))(NinjaBase+0x8241c);
     assign((void *)(NinjaBase+0x10fef8),url,strlen(url));assign((void *)(NinjaBase+0x10ff10),url,strlen(url));AccountLinksConfigured=YES;
 }
-static id FindProfileNode(void){
-    id director=ObjectCall(objc_getClass("CCDirector"),"sharedDirector"),scene=ObjectCall(director,"runningScene");if(!scene)return nil;
-    NSMutableArray *queue=[NSMutableArray arrayWithObject:scene];NSUInteger index=0;Class target=objc_getClass("TopBarUserProfileButton");
-    while(index<queue.count&&index<5000){id node=queue[index++];if(target&&[node isKindOfClass:target])return node;id kids=ObjectCall(node,"children");if([kids conformsToProtocol:@protocol(NSFastEnumeration)])for(id child in kids)if(child&&queue.count<5000)[queue addObject:child];}return nil;
-}
-static void BootstrapViews(void){
-    id lobby=nil;@synchronized(Lock){lobby=LastLobby;}
-    if(!lobby){lobby=FindProfileNode();SEL update=sel_registerName("updateUserInfo");const char *a[]={"@",":"};if(lobby&&Args(class_getInstanceMethod(object_getClass(lobby),update),"v",a,2))((void(*)(id,SEL))objc_msgSend)(lobby,update);}
-    id existingHUD=nil;@synchronized(Lock){existingHUD=LastHUD;}if(!existingHUD)return;id gm=ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),hud=ObjectCall(gm,"gameHUD");Class cls=objc_getClass("GameHUDTwoPlayerGame");
-    if(cls&&[hud isKindOfClass:cls]){@synchronized(Lock){LastHUD=hud;}int side=NativeLocalSide(hud);if(side){@synchronized(Lock){HUDSide=side;}atomic_store(&LocalHUDFound,true);}}
+static void BootstrapStep(void){
+    static NSMutableArray *queue;static NSUInteger index,visited;
+    id lobby=nil,trophy=nil;@synchronized(Lock){lobby=LastLobby;trophy=LastTrophy;}
+    if(lobby||trophy){queue=nil;atomic_store(&DiscoveryRequested,false);return;}
+    if(!queue){if(!atomic_exchange(&DiscoveryRequested,false))return;id director=ObjectCall(objc_getClass("CCDirector"),"sharedDirector");queue=[NSMutableArray array];for(NSString *key in @[@"runningScene",@"notificationNode"]){id root=ObjectCall(director,key.UTF8String);if(root)[queue addObject:root];}index=visited=0;}
+    Class a=objc_getClass("TopBarUserProfileButton"),b=objc_getClass("TopBarTrophyButton");id found=nil;
+    for(unsigned step=0;step<24&&index<queue.count&&visited<768;step++,visited++){
+        id node=queue[index++];if((a&&[node isKindOfClass:a])||(b&&[node isKindOfClass:b])){found=node;break;}
+        id children=ObjectCall(node,"children");if([children conformsToProtocol:@protocol(NSFastEnumeration)])for(id child in children){if(queue.count>=1024)break;if(child)[queue addObject:child];}
+    }
+    if(found){queue=nil;SEL update=sel_registerName("updateUserInfo");const char *args[]={"@",":"};if(Args(class_getInstanceMethod(object_getClass(found),update),"v",args,2))((void(*)(id,SEL))objc_msgSend)(found,update);return;}
+    if(index>=queue.count||visited>=768)queue=nil;
 }
 typedef struct {float x,y,w,h;} MenuRect;
 static CGRect Convert(MenuRect r,UIWindow *w){int sw=*(volatile int *)(NinjaBase+0x1113b0),sh=*(volatile int *)(NinjaBase+0x1113b4);if(sw<1||sh<1)return CGRectZero;return CGRectMake(r.x*w.bounds.size.width/sw,r.y*w.bounds.size.height/sh,r.w*w.bounds.size.width/sw,r.h*w.bounds.size.height/sh);}
 static UIColor *Cyan(void){return [UIColor colorWithRed:0 green:.94 blue:.95 alpha:1];}
 static UIColor *Dark(void){return [UIColor colorWithRed:.075 green:.10 blue:.13 alpha:1];}
 static UIImage *Asset(NSString *name){Dl_info d={0};if(!dladdr((const void *)Asset,&d)||!d.dli_fname)return nil;NSString *dir=[@(d.dli_fname) stringByDeletingLastPathComponent];return [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name]];}
-static void Changed(void){NSUserDefaults *p=NSUserDefaults.standardUserDefaults;[p setInteger:atomic_load(&LevelOn) forKey:@"SkinMenu.LevelOn"];[p setInteger:atomic_load(&LevelValue) forKey:@"SkinMenu.Level"];[p setInteger:atomic_load(&LeagueValue) forKey:@"SkinMenu.League"];atomic_store(&Dirty,true);}
+static void Changed(void){NSUserDefaults *p=NSUserDefaults.standardUserDefaults;[p setInteger:atomic_load(&LevelOn) forKey:@"SkinMenu.LevelOn"];[p setInteger:atomic_load(&LevelValue) forKey:@"SkinMenu.Level"];[p setInteger:atomic_load(&LeagueValue) forKey:@"SkinMenu.League"];atomic_store(&Dirty,true);atomic_store(&DiscoveryRequested,true);}
 static void Export(void){
-    NSDictionary *report=@{@"format":@"SkinMenu-4",@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
+    NSDictionary *report=@{@"format":@"SkinMenu-5",@"actualManagerCaptured":@(ActualManager!=nil),@"gameManagerPresent":@(ObjectCall(objc_getClass("GameManager"),"sharedGameManager")!=nil),@"localPlayerPresent":@(ObjectCall(ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),"player")!=nil),@"activationTextVerified":@(atomic_load(&IntegrityVerified)),@"trophyHookInstalled":@(OldTrophy!=NULL),@"trophyCalls":@(atomic_load(&TrophyCalls)),@"ownFrameWorstMs":@(atomic_load(&OwnMaxMicros)/1000.0),@"gameFrameWorstMs":@(atomic_load(&BaseMaxMicros)/1000.0),@"ownSlowFrames":@(atomic_load(&SlowOwnFrames)),@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
     NSError *e=nil;NSData *data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:&e];NSURL *dir=[NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;NSURL *file=[dir URLByAppendingPathComponent:@"SkinMenu-report.json"];
     if(!data||![data writeToURL:file options:NSDataWritingAtomic error:&e])return;
     UIActivityViewController *s=[[UIActivityViewController alloc]initWithActivityItems:@[file] applicationActivities:nil];UIViewController *top=Top();if(!top)return;s.popoverPresentationController.sourceView=top.view;s.popoverPresentationController.sourceRect=CGRectMake(CGRectGetMidX(top.view.bounds),CGRectGetMidY(top.view.bounds),1,1);[top presentViewController:s animated:YES completion:nil];
@@ -333,6 +388,8 @@ static void Export(void){
 @property(nonatomic) NSInteger kind;
 @property(nonatomic) NSUInteger revision;
 @property(nonatomic) unsigned ticks;
+@property(nonatomic) int previousNativeTab;
+@property(nonatomic) BOOL previousAccess;
 - (void)tick;
 @end
 @implementation SkinMenuView
@@ -363,7 +420,7 @@ static void Export(void){
 - (void)tab:(UIButton *)button {
     self.skins=button.tag==3;if(button.tag==4)atomic_store(&AccountLinksConfigured,false);int original=(int)(button.tag==4?3:button.tag);if(self.skins)original=3;
     if(NinjaVerified){*(volatile int *)(NinjaBase+0x1113fc)=original;*(volatile unsigned char *)(NinjaBase+0x1113b8)=1;}
-    self.body.hidden=!self.skins;self.revision=NSUIntegerMax;[self setNeedsLayout];[self tick];
+    self.body.hidden=!self.skins;if(self.skins)atomic_store(&DiscoveryRequested,true);self.revision=NSUIntegerMax;[self setNeedsLayout];[self tick];
 }
 - (void)star:(UIButton *)button {static const int codes[7]={105,109,107,101,104,108,106};atomic_store(&LeagueValue,codes[button.tag]);atomic_store(&LevelOn,1);Changed();[self setNeedsLayout];}
 - (void)level:(UISlider *)slider {atomic_store(&LevelValue,(int)lroundf(slider.value));atomic_store(&LevelOn,1);Changed();self.valueLabel.text=[NSString stringWithFormat:@"%d",atomic_load(&LevelValue)];}
@@ -401,19 +458,19 @@ static void Export(void){
     for(NSUInteger i=0;i<self.tiles.count;i++){UIButton *b=self.tiles[i];b.frame=CGRectMake(pad+(i%3)*(tileW+gap),y+(i/3)*(tileH+gap),tileW,tileH);b.layer.borderWidth=b.tag==chosen?2:0;b.layer.borderColor=Cyan().CGColor;}
     y+=ceil(self.tiles.count/3.0)*(tileH+gap)+8;
     NSString *status=Access()?@"تغييرات المظهر محلية. الصور من العناصر التي عُرضت على الجهاز.":@"التفعيل غير نشط؛ الخيارات لن تُطبّق حتى تفعيل الاشتراك.";
-    self.note.text=[status stringByAppendingString:@"\nاعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
+    if(!atomic_load(&IntegrityVerified))status=@"تعذر التحقق من مكتبة التفعيل؛ شارك تقرير المشكلة.";self.note.text=[status stringByAppendingString:@"\nاعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
     self.restoreButton.frame=CGRectMake(pad,y,inside/2,36);self.reportButton.frame=CGRectMake(pad+inside/2,y,inside/2,36);y+=46;self.body.contentSize=CGSizeMake(width,y);
 }
 - (void)tick {
-    FindNinja();InstallHooks();UIWindow *w=Window();if(!w||!NinjaVerified){self.hidden=YES;return;}
+    FindNinja();InstallHooks();UIWindow *w=Window();if(!w||!NinjaVerified){self.hidden=YES;atomic_store(&WantThumbnails,false);return;}
     if(self.superview!=w)[w addSubview:self];self.frame=w.bounds;
     BOOL visible=*(volatile unsigned char *)(NinjaBase+0x1113a5)&&*(volatile int *)(NinjaBase+0x1113f8)>0;
-    self.hidden=!visible;if(!visible)return;
+    self.hidden=!visible;atomic_store(&WantThumbnails,visible&&self.skins);if(!visible)return;
     MenuRect (*panel)(void)=(MenuRect(*)(void))(NinjaBase+0x9db40),(*content)(void)=(MenuRect(*)(void))(NinjaBase+0xa66b8);
     CGRect p=Convert(panel(),w),c=Convert(content(),w);if(!isfinite(p.origin.x)||!isfinite(c.origin.y)||p.size.width<100||p.size.height<100){self.hidden=YES;return;}
-    CGFloat header=MAX(42,MIN(p.size.height*.30,c.origin.y-p.origin.y-3));self.bar.frame=CGRectMake(p.origin.x+6,p.origin.y+2,MAX(100,p.size.width-42),header+1);
+    CGRect priorBar=self.bar.frame,priorBody=self.body.frame;CGFloat header=MAX(42,MIN(p.size.height*.30,c.origin.y-p.origin.y-3));self.bar.frame=CGRectMake(p.origin.x+6,p.origin.y+2,MAX(100,p.size.width-42),header+1);
     CGRect bodyRect=CGRectIntersection(CGRectMake(p.origin.x+5,p.origin.y+header+3,p.size.width-10,p.size.height-header-8),w.bounds);if(CGRectIsNull(bodyRect)||bodyRect.size.height<20){self.hidden=YES;return;}self.body.frame=bodyRect;self.body.hidden=!self.skins;[w bringSubviewToFront:self];
-    self.ticks++;if(self.ticks%8==0&&self.skins)[self rebuild];[self setNeedsLayout];
+    self.ticks++;if(self.ticks%8==0&&self.skins)[self rebuild];int native=*(volatile int *)(NinjaBase+0x1113fc);BOOL active=Access();if(!CGRectEqualToRect(priorBar,self.bar.frame)||!CGRectEqualToRect(priorBody,self.body.frame)||native!=self.previousNativeTab||active!=self.previousAccess)[self setNeedsLayout];self.previousNativeTab=native;self.previousAccess=active;
 }
 @end
 @interface SkinDeveloperLink : NSObject
@@ -442,7 +499,8 @@ static SkinMenuView *Menu;
 + (void)tick:(CADisplayLink *)link {(void)link;WireLoginDeveloper();[Menu tick];}
 @end
 __attribute__((constructor)) static void Start(void){dispatch_async(dispatch_get_main_queue(),^{
-    Lock=[NSObject new];CueDefinitions=[NSMutableDictionary dictionary];CueImages=[NSMutableDictionary dictionary];FrameImages=[NSMutableDictionary dictionary];AvatarImages=[NSMutableDictionary dictionary];CueIDs=[NSMutableSet set];FrameIDs=[NSMutableSet set];AvatarIDs=[NSMutableSet set];PendingImages=[NSMutableSet set];CaptureQueue=[NSMutableArray array];
+    VerifyActivation();Lock=[NSObject new];ObservedNodes=[NSMapTable strongToWeakObjectsMapTable];CueDefinitions=[NSMutableDictionary dictionary];CueImages=[NSMutableDictionary dictionary];FrameImages=[NSMutableDictionary dictionary];AvatarImages=[NSMutableDictionary dictionary];CueIDs=[NSMutableSet set];FrameIDs=[NSMutableSet set];AvatarIDs=[NSMutableSet set];
     NSUserDefaults *p=NSUserDefaults.standardUserDefaults;int level=(int)[p integerForKey:@"SkinMenu.Level"];atomic_store(&LevelValue,level>=1&&level<=999?level:100);int league=(int)[p integerForKey:@"SkinMenu.League"];BOOL validLeague=league==105||league==109||league==107||league==101||league==104||league==108||league==106;atomic_store(&LeagueValue,validLeague?league:105);atomic_store(&LevelOn,(int)[p integerForKey:@"SkinMenu.LevelOn"]);atomic_store(&CueValue,-1);atomic_store(&FrameValue,-1);atomic_store(&AvatarValue,-1);
     Menu=[[SkinMenuView alloc]initWithFrame:CGRectZero];Menu.hidden=YES;CADisplayLink *clock=[CADisplayLink displayLinkWithTarget:SkinMenuClock.class selector:@selector(tick:)];clock.preferredFramesPerSecond=20;[clock addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 });}
+
