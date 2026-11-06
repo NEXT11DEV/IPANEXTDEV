@@ -21,6 +21,8 @@ static _Atomic bool IntegrityVerified;
 static uintptr_t ActivationTextStart,ActivationTextEnd;
 static _Atomic unsigned OwnMaxMicros,BaseMaxMicros,SlowOwnFrames;
 static NSMapTable *ObservedNodes;
+static NSMutableSet *ThumbnailPending,*ThumbnailMissing;
+static _Atomic unsigned ThumbnailRequests,ThumbnailReady;
 static void BootstrapStep(void);
 static _Atomic unsigned CueCalls,StarCalls,HUDCalls,FrameCalls,AvatarCalls,DrawCalls,OffMainCalls;
 static _Atomic bool LocalHUDFound;
@@ -46,8 +48,6 @@ static id FieldObject(id object,const char *name);
 static NSMutableSet *CueIDs,*FrameIDs,*AvatarIDs;
 
 static __weak id LastCue,LastWidget,LastHUD,LastAvatar,ActualManager;
-static BOOL (*OldUpdatePrompt)(id,SEL);
-static BOOL SuppressUpdatePrompt(id self,SEL cmd){(void)self;(void)cmd;return NO;}
 static void (*OldManagerCue)(id,SEL);
 static void (*OldManagerStarted)(id,SEL,const void *);
 static int OriginalCueID,OriginalCueLevel,HUDSide;
@@ -225,7 +225,6 @@ static void SlotAvatar(id self,SEL cmd,id player,id offline,int selected,unsigne
 }
 static void NewSlot1(id self,SEL cmd,id p,id o,int s,unsigned r){SlotAvatar(self,cmd,p,o,s,r,1);}
 static void NewSlot2(id self,SEL cmd,id p,id o,int s,unsigned r){SlotAvatar(self,cmd,p,o,s,r,2);}
-static char TypeAt(Method m,unsigned index){char *t=method_copyArgumentType(m,index);char v=t?t[0]:0;free(t);return v;}
 static BOOL Args(Method m,const char *ret,const char **args,unsigned count){
     if(!m||method_getNumberOfArguments(m)!=count)return NO;char *t=method_copyReturnType(m);BOOL ok=t&&strcmp(t,ret)==0;free(t);
     for(unsigned i=0;i<count&&ok;i++){t=method_copyArgumentType(m,i);ok=t&&strcmp(t,args[i])==0;free(t);}return ok;
@@ -248,60 +247,41 @@ static BOOL Install(const char *cn,const char *mn,BOOL meta,IMP replacement,IMP 
     if(*old)return YES;Class cls=objc_getClass(cn);if(!cls)return NO;if(meta)cls=object_getClass(cls);SEL sel=sel_registerName(mn);Method m=class_getInstanceMethod(cls,sel);if(!Args(m,ret,args,n))return NO;
     *old=method_getImplementation(m);class_replaceMethod(cls,sel,replacement,method_getTypeEncoding(m));return YES;
 }
-static UIImage *Snapshot(id node){
-    if(!ObjectCall(objc_getClass("EAGLContext"),"currentContext"))return nil;
-    SEL sizeS=sel_registerName("contentSize"),posS=sel_registerName("position"),setPosS=sel_registerName("setPosition:"),visitS=sel_registerName("visit");
-    NSMethodSignature *sizeSig=[node methodSignatureForSelector:sizeS],*posSig=[node methodSignatureForSelector:posS];
-    if(sizeSig.methodReturnLength!=sizeof(CGSize)||posSig.methodReturnLength!=sizeof(CGPoint)||![node respondsToSelector:setPosS]||![node respondsToSelector:visitS])return nil;
-    CGSize size=((CGSize(*)(id,SEL))objc_msgSend)(node,sizeS);CGPoint position=((CGPoint(*)(id,SEL))objc_msgSend)(node,posS);
-    if(!isfinite(size.width)||!isfinite(size.height)||size.width<1||size.height<1||size.width>8192||size.height>8192)return nil;
-    SEL sxS=sel_registerName("scaleX"),syS=sel_registerName("scaleY"),setSX=sel_registerName("setScaleX:"),setSY=sel_registerName("setScaleY:");
-    Method mx=class_getInstanceMethod(object_getClass(node),sxS),my=class_getInstanceMethod(object_getClass(node),syS);
-    char *rx=mx?method_copyReturnType(mx):NULL,*ry=my?method_copyReturnType(my):NULL;
-    BOOL scalable=rx&&ry&&rx[0]=='f'&&ry[0]=='f'&&[node respondsToSelector:setSX]&&[node respondsToSelector:setSY];free(rx);free(ry);
-    if(!scalable&&MAX(size.width,size.height)>700)return nil;
-    float oldX=scalable?((float(*)(id,SEL))objc_msgSend)(node,sxS):1,oldY=scalable?((float(*)(id,SEL))objc_msgSend)(node,syS):1;
-    CGFloat factor=scalable?MIN(1,480/MAX(size.width,size.height)):1;CGFloat width=ceil(size.width*factor)+12,height=ceil(size.height*factor)+12;
-    Class rtClass=objc_getClass("CCRenderTexture");SEL create=sel_registerName("renderTextureWithWidth:height:");Method factory=rtClass?class_getClassMethod(rtClass,create):NULL;
-    if(!factory||method_getNumberOfArguments(factory)!=4)return nil;
-    id rt=nil;char type=TypeAt(factory,2);if(TypeAt(factory,3)!=type)return nil;
-    if(type=='i')rt=((id(*)(id,SEL,int,int))objc_msgSend)(rtClass,create,(int)width,(int)height);
-    else if(type=='f')rt=((id(*)(id,SEL,float,float))objc_msgSend)(rtClass,create,(float)width,(float)height);
-    else if(type=='d')rt=((id(*)(id,SEL,double,double))objc_msgSend)(rtClass,create,width,height);
-    SEL begin=sel_registerName("beginWithClear:g:b:a:"),end=sel_registerName("end");
-    Method bm=rt?class_getInstanceMethod(object_getClass(rt),begin):NULL;const char *clearArgs[]={"@",":","f","f","f","f"};
-    if(!rt||!Args(bm,"v",clearArgs,6)||![rt respondsToSelector:end]||![rt respondsToSelector:sel_registerName("getUIImage")])return nil;
-    CGPoint anchor=CGPointMake(.5,.5);SEL anchorS=sel_registerName("anchorPoint");NSMethodSignature *as=[node methodSignatureForSelector:anchorS];if(as.methodReturnLength==sizeof(CGPoint))anchor=((CGPoint(*)(id,SEL))objc_msgSend)(node,anchorS);
-    SEL rotS=sel_registerName("rotation"),setRot=sel_registerName("setRotation:");Method rm=class_getInstanceMethod(object_getClass(node),rotS);char *rr=rm?method_copyReturnType(rm):NULL;BOOL rotate=rr&&rr[0]=='f'&&[node respondsToSelector:setRot];free(rr);float oldRot=rotate?((float(*)(id,SEL))objc_msgSend)(node,rotS):0;
-    UIImage *image=nil;BOOL begun=NO;
-    @try {
-        if(scalable){((void(*)(id,SEL,float))objc_msgSend)(node,setSX,(float)factor);((void(*)(id,SEL,float))objc_msgSend)(node,setSY,(float)factor);}
-        if(rotate)((void(*)(id,SEL,float))objc_msgSend)(node,setRot,0);
-        ((void(*)(id,SEL,CGPoint))objc_msgSend)(node,setPosS,CGPointMake(6+anchor.x*size.width*factor,6+anchor.y*size.height*factor));
-        ((void(*)(id,SEL,float,float,float,float))objc_msgSend)(rt,begin,0,0,0,0);begun=YES;
-        ((void(*)(id,SEL))objc_msgSend)(node,visitS);((void(*)(id,SEL))objc_msgSend)(rt,end);begun=NO;
-        id result=ObjectCall(rt,"getUIImage");if([result isKindOfClass:UIImage.class])image=result;
-    } @catch(NSException *exception){(void)exception;image=nil;}
-    @finally {
-        if(begun)((void(*)(id,SEL))objc_msgSend)(rt,end);
-        ((void(*)(id,SEL,CGPoint))objc_msgSend)(node,setPosS,position);
-        if(scalable){((void(*)(id,SEL,float))objc_msgSend)(node,setSX,oldX);((void(*)(id,SEL,float))objc_msgSend)(node,setSY,oldY);}
-        if(rotate)((void(*)(id,SEL,float))objc_msgSend)(node,setRot,oldRot);
-    }
-    if(image.size.height>image.size.width*2.5)image=[UIImage imageWithCGImage:image.CGImage scale:image.scale orientation:UIImageOrientationRight];
-    return image;
+// Read the source image rather than rendering live game nodes into an OpenGL texture.
+static NSString *ThumbnailName(id node){
+    id name=ObjectCall(node,"finalTextureName");if([name isKindOfClass:NSString.class]&&[name length])return name;
+    id child=FieldObject(node,"mPlayerImage");name=ObjectCall(child,"finalTextureName");return [name isKindOfClass:NSString.class]?name:nil;
 }
 static void ProcessCapture(void){
     if(!atomic_load(&WantThumbnails))return;
-    @synchronized(Lock){if(LastHUD||LastCue)return;}
-    NSDictionary *job=nil;
+    NSNumber *value=nil;int kindFound=0;NSString *key=nil;id node=nil;
     @synchronized(Lock){
-        for(int kind=0;kind<3&&!job;kind++)for(NSNumber *value in IDs(kind)){
-            if(Images(kind)[value])continue;NSString *key=[NSString stringWithFormat:@"%d:%@",kind,value];id node=[ObservedNodes objectForKey:key];
-            if(node){job=@{@"kind":@(kind),@"id":value,@"node":node};break;}
+        for(int kind=0;kind<3&&!node;kind++)for(NSNumber *candidate in IDs(kind)){
+            NSString *candidateKey=[NSString stringWithFormat:@"%d:%@",kind,candidate];
+            if(Images(kind)[candidate]||[ThumbnailPending containsObject:candidateKey]||[ThumbnailMissing containsObject:candidateKey])continue;
+            id observed=[ObservedNodes objectForKey:candidateKey];if(observed){value=candidate;kindFound=kind;key=candidateKey;node=observed;break;}
         }
     }
-    if(!job)return;UIImage *image=Snapshot(job[@"node"]);if(image)@synchronized(Lock){Images([job[@"kind"] intValue])[job[@"id"]]=image;}
+    if(!node)return;NSString *name=ThumbnailName(node);if(!name.length)return;
+    @synchronized(Lock){[ThumbnailPending addObject:key];}
+    NSString *sourceName=[name copy];int sourceKind=kindFound;NSNumber *sourceValue=value;NSString *sourceKey=key;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+        NSString *path=[sourceName hasPrefix:@"/"]?sourceName:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:sourceName];
+        UIImage *local=[UIImage imageWithContentsOfFile:path];
+        if(local){@synchronized(Lock){Images(sourceKind)[sourceValue]=local;[ThumbnailPending removeObject:sourceKey];}atomic_fetch_add(&ThumbnailReady,1);return;}
+        NSString *filename=sourceName.lastPathComponent;
+        // Use only a cue filename actually requested by the game's sprite definition.
+        if(![filename hasPrefix:@"Shop_"]||![filename.pathExtension.lowercaseString isEqualToString:@"png"]){@synchronized(Lock){[ThumbnailPending removeObject:sourceKey];[ThumbnailMissing addObject:sourceKey];}return;}
+        NSURLComponents *url=[NSURLComponents componentsWithString:@"https://v56-mobile-live-config.pool.miniclippt.com/client/40/"];
+        url.path=[url.path stringByAppendingString:filename];NSURLRequest *request=[NSURLRequest requestWithURL:url.URL cachePolicy:NSURLRequestReturnCacheDataElseLoad timeoutInterval:12];
+        atomic_fetch_add(&ThumbnailRequests,1);
+        [[NSURLSession.sharedSession dataTaskWithRequest:request completionHandler:^(NSData *data,NSURLResponse *response,NSError *error){
+            BOOL ok=!error&&[response isKindOfClass:NSHTTPURLResponse.class]&&((NSHTTPURLResponse *)response).statusCode==200&&data.length>0&&data.length<=3*1024*1024;
+            UIImage *image=ok?[UIImage imageWithData:data]:nil;
+            @synchronized(Lock){[ThumbnailPending removeObject:sourceKey];if(image)Images(sourceKind)[sourceValue]=image;else [ThumbnailMissing addObject:sourceKey];}
+            if(image)atomic_fetch_add(&ThumbnailReady,1);
+        }] resume];
+    });
 }
 static void MaxCounter(_Atomic unsigned *counter,unsigned value){unsigned old=atomic_load(counter);while(value>old&&!atomic_compare_exchange_weak(counter,&old,value)){};}
 static void NewDraw(id self,SEL cmd){
@@ -316,7 +296,6 @@ static void InstallHooks(void){
     const char *eventArgs[]={"@",":","r^v"};
     Install("GameManager","setActiveVisualCue",NO,(IMP)NewManagerCue,(IMP *)&OldManagerCue,"v",factory,2);
     Install("GameManager","networkEventGameStarted:",NO,(IMP)NewManagerStarted,(IMP *)&OldManagerStarted,"v",eventArgs,3);
-    Install("UserInfo","showUpdatePopup",NO,(IMP)SuppressUpdatePrompt,(IMP *)&OldUpdatePrompt,"B",factory,2);
     BOOL star=Install("MatchScreenPlayerWidget","setupStarWithLeague:andLevel:",NO,(IMP)NewStar,(IMP *)&OldStar,"v",pair,4);
     BOOL local=star&&Install("MatchScreenPlayerWidget","createLocalPlayerWidget",YES,(IMP)NewLocal,(IMP *)&OldLocalFactory,"@",factory,2);
     const char *definitionArgs[]={"@",":","@","i","i","B"},*lobbyArgs[]={"@",":","@","@"};
@@ -378,9 +357,9 @@ static CGRect Convert(MenuRect r,UIWindow *w){int sw=*(volatile int *)(NinjaBase
 static UIColor *Cyan(void){return [UIColor colorWithRed:0 green:.94 blue:.95 alpha:1];}
 static UIColor *Dark(void){return [UIColor colorWithRed:.075 green:.10 blue:.13 alpha:1];}
 static UIImage *Asset(NSString *name){Dl_info d={0};if(!dladdr((const void *)Asset,&d)||!d.dli_fname)return nil;NSString *dir=[@(d.dli_fname) stringByDeletingLastPathComponent];return [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name]];}
-static void Changed(void){NSUserDefaults *p=NSUserDefaults.standardUserDefaults;[p setInteger:atomic_load(&LevelOn) forKey:@"SkinMenu.LevelOn"];[p setInteger:atomic_load(&LevelValue) forKey:@"SkinMenu.Level"];[p setInteger:atomic_load(&LeagueValue) forKey:@"SkinMenu.League"];atomic_store(&Dirty,true);atomic_store(&DiscoveryRequested,true);}
+static void Changed(void){NSUserDefaults *p=NSUserDefaults.standardUserDefaults;[p setInteger:atomic_load(&CueValue) forKey:@"SkinMenu.Cue"];[p setInteger:atomic_load(&FrameValue) forKey:@"SkinMenu.Frame"];[p setInteger:atomic_load(&AvatarValue) forKey:@"SkinMenu.Avatar"];[p setInteger:atomic_load(&LevelOn) forKey:@"SkinMenu.LevelOn"];[p setInteger:atomic_load(&LevelValue) forKey:@"SkinMenu.Level"];[p setInteger:atomic_load(&LeagueValue) forKey:@"SkinMenu.League"];atomic_store(&Dirty,true);atomic_store(&DiscoveryRequested,true);}
 static void Export(void){
-    NSDictionary *report=@{@"format":@"SkinMenu-6",@"optionalUpdatePromptHook":@(OldUpdatePrompt!=NULL),@"actualManagerCaptured":@(ActualManager!=nil),@"gameManagerPresent":@(ObjectCall(objc_getClass("GameManager"),"sharedGameManager")!=nil),@"localPlayerPresent":@(ObjectCall(ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),"player")!=nil),@"activationTextVerified":@(atomic_load(&IntegrityVerified)),@"trophyHookInstalled":@(OldTrophy!=NULL),@"trophyCalls":@(atomic_load(&TrophyCalls)),@"ownFrameWorstMs":@(atomic_load(&OwnMaxMicros)/1000.0),@"gameFrameWorstMs":@(atomic_load(&BaseMaxMicros)/1000.0),@"ownSlowFrames":@(atomic_load(&SlowOwnFrames)),@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
+    NSDictionary *report=@{@"format":@"SkinMenu-7",@"updateHandling":@"Original v5 game executable; no update hooks",@"thumbnailRequests":@(atomic_load(&ThumbnailRequests)),@"thumbnailReady":@(atomic_load(&ThumbnailReady)),@"actualManagerCaptured":@(ActualManager!=nil),@"gameManagerPresent":@(ObjectCall(objc_getClass("GameManager"),"sharedGameManager")!=nil),@"localPlayerPresent":@(ObjectCall(ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),"player")!=nil),@"activationTextVerified":@(atomic_load(&IntegrityVerified)),@"trophyHookInstalled":@(OldTrophy!=NULL),@"trophyCalls":@(atomic_load(&TrophyCalls)),@"ownFrameWorstMs":@(atomic_load(&OwnMaxMicros)/1000.0),@"gameFrameWorstMs":@(atomic_load(&BaseMaxMicros)/1000.0),@"ownSlowFrames":@(atomic_load(&SlowOwnFrames)),@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
     NSError *e=nil;NSData *data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:&e];NSURL *dir=[NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;NSURL *file=[dir URLByAppendingPathComponent:@"SkinMenu-report.json"];
     if(!data||![data writeToURL:file options:NSDataWritingAtomic error:&e])return;
     UIActivityViewController *s=[[UIActivityViewController alloc]initWithActivityItems:@[file] applicationActivities:nil];UIViewController *top=Top();if(!top)return;s.popoverPresentationController.sourceView=top.view;s.popoverPresentationController.sourceRect=CGRectMake(CGRectGetMidX(top.view.bounds),CGRectGetMidY(top.view.bounds),1,1);[top presentViewController:s animated:YES completion:nil];
@@ -418,9 +397,9 @@ static void Export(void){
         NSArray *colors=@[@"magenta",@"cyan",@"green",@"amber",@"gunmetal",@"red",@"blue"];
         for(int i=0;i<7;i++){UIButton *b=[UIButton buttonWithType:UIButtonTypeCustom];b.tag=i;b.layer.cornerRadius=6;[b setImage:Asset([NSString stringWithFormat:@"league_star_%@.png",colors[i]]) forState:UIControlStateNormal];b.imageView.contentMode=UIViewContentModeScaleAspectFit;[b addTarget:self action:@selector(star:) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:b];[self.stars addObject:b];}
         self.levelLabel=[self label:@"Level" color:UIColor.whiteColor size:19];[self.body addSubview:self.levelLabel];self.valueLabel=[self label:@"100" color:Cyan() size:18];self.valueLabel.textAlignment=NSTextAlignmentRight;[self.body addSubview:self.valueLabel];
-        self.slider=[UISlider new];self.slider.minimumValue=1;self.slider.maximumValue=999;self.slider.minimumTrackTintColor=Cyan();self.slider.maximumTrackTintColor=[UIColor colorWithWhite:.22 alpha:1];[self.slider addTarget:self action:@selector(level:) forControlEvents:UIControlEventValueChanged];[self.body addSubview:self.slider];
+        self.slider=[UISlider new];self.slider.minimumValue=1;self.slider.maximumValue=999;self.slider.minimumTrackTintColor=Cyan();self.slider.maximumTrackTintColor=[UIColor colorWithWhite:.22 alpha:1];[self.slider addTarget:self action:@selector(levelPreview:) forControlEvents:UIControlEventValueChanged];[self.slider addTarget:self action:@selector(level:) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel];[self.body addSubview:self.slider];
         self.segments=[[UISegmentedControl alloc]initWithItems:@[@"Cue",@"Frame",@"Avatar"]];self.segments.selectedSegmentIndex=0;self.segments.selectedSegmentTintColor=Cyan();self.segments.backgroundColor=[UIColor colorWithWhite:.17 alpha:1];[self.segments setTitleTextAttributes:@{NSForegroundColorAttributeName:UIColor.whiteColor,NSFontAttributeName:[UIFont systemFontOfSize:17]} forState:UIControlStateNormal];[self.segments setTitleTextAttributes:@{NSForegroundColorAttributeName:UIColor.blackColor} forState:UIControlStateSelected];[self.segments addTarget:self action:@selector(segment:) forControlEvents:UIControlEventValueChanged];[self.body addSubview:self.segments];
-        self.galleryTitle=[self label:@"Cue Skin" color:Cyan() size:16];[self.body addSubview:self.galleryTitle];self.note=[self label:@"اعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا." color:[UIColor colorWithWhite:.7 alpha:1] size:12];self.note.numberOfLines=0;[self.body addSubview:self.note];self.tiles=[NSMutableArray array];
+        self.galleryTitle=[self label:@"Cue Skin" color:Cyan() size:16];[self.body addSubview:self.galleryTitle];self.note=[self label:@"تظهر هنا العناصر التي رصدتها اللعبة؛ المعاينة لا تعني امتلاك العنصر." color:[UIColor colorWithWhite:.7 alpha:1] size:12];self.note.numberOfLines=0;[self.body addSubview:self.note];self.tiles=[NSMutableArray array];
         self.restoreButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.restoreButton setTitle:@"إرجاع المظهر الأصلي" forState:UIControlStateNormal];self.restoreButton.tintColor=Cyan();[self.restoreButton addTarget:self action:@selector(restore) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:self.restoreButton];
         self.reportButton=[UIButton buttonWithType:UIButtonTypeSystem];[self.reportButton setTitle:@"مشاركة تقرير المشكلة" forState:UIControlStateNormal];self.reportButton.tintColor=Cyan();[self.reportButton addTarget:self action:@selector(report) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:self.reportButton];
         self.kind=0;self.revision=NSUIntegerMax;self.body.hidden=YES;
@@ -433,9 +412,10 @@ static void Export(void){
     self.body.hidden=!self.skins;if(self.skins)atomic_store(&DiscoveryRequested,true);self.revision=NSUIntegerMax;[self setNeedsLayout];[self tick];
 }
 - (void)star:(UIButton *)button {static const int codes[7]={105,109,107,101,104,108,106};atomic_store(&LeagueValue,codes[button.tag]);atomic_store(&LevelOn,1);Changed();[self setNeedsLayout];}
+- (void)levelPreview:(UISlider *)slider {self.valueLabel.text=[NSString stringWithFormat:@"%d",(int)lroundf(slider.value)];}
 - (void)level:(UISlider *)slider {atomic_store(&LevelValue,(int)lroundf(slider.value));atomic_store(&LevelOn,1);Changed();self.valueLabel.text=[NSString stringWithFormat:@"%d",atomic_load(&LevelValue)];}
 - (void)segment:(UISegmentedControl *)s {self.kind=s.selectedSegmentIndex;self.revision=NSUIntegerMax;[self rebuild];}
-- (void)choose:(UIButton *)b {if(self.kind==0)atomic_store(&CueValue,(int)b.tag);else if(self.kind==1)atomic_store(&FrameValue,(int)b.tag);else atomic_store(&AvatarValue,(int)b.tag);atomic_store(&Dirty,true);self.revision=NSUIntegerMax;[self rebuild];}
+- (void)choose:(UIButton *)b {if(self.kind==0)atomic_store(&CueValue,(int)b.tag);else if(self.kind==1)atomic_store(&FrameValue,(int)b.tag);else atomic_store(&AvatarValue,(int)b.tag);Changed();self.revision=NSUIntegerMax;[self rebuild];}
 - (void)restore {atomic_store(&LevelOn,0);atomic_store(&CueValue,-1);atomic_store(&FrameValue,-1);atomic_store(&AvatarValue,-1);Changed();self.revision=NSUIntegerMax;[self rebuild];}
 - (void)report {Export();}
 - (void)developer {[UIApplication.sharedApplication openURL:[NSURL URLWithString:@"https://t.me/YG8_1"] options:@{} completionHandler:nil];}
@@ -444,11 +424,11 @@ static void Export(void){
     NSUInteger revision=ids.count*1000+images.count+(NSUInteger)self.kind*100000;
     if(revision==self.revision)return;self.revision=revision;
     for(UIView *v in self.tiles)[v removeFromSuperview];[self.tiles removeAllObjects];
-    NSMutableArray *values=[NSMutableArray arrayWithObject:@(-1)];if(ids.count)[values addObjectsFromArray:ids];
+    NSMutableArray *values=[NSMutableArray arrayWithObject:@(-1)];for(NSNumber *value in ids)if(self.kind!=1||value.intValue>0)[values addObject:value];
     for(NSNumber *number in values){UIButton *b=[UIButton buttonWithType:UIButtonTypeCustom];b.tag=number.integerValue;b.layer.cornerRadius=7;b.clipsToBounds=YES;b.backgroundColor=[UIColor colorWithWhite:.18 alpha:1];b.imageView.contentMode=UIViewContentModeScaleAspectFit;
         if(number.intValue<0){[b setTitle:@"Off" forState:UIControlStateNormal];[b setTitleColor:UIColor.lightGrayColor forState:UIControlStateNormal];}
-        else if(images[number]){[b setImage:images[number] forState:UIControlStateNormal];}
-        else{[b setTitle:[NSString stringWithFormat:@"%@ · انتظار الصورة",number] forState:UIControlStateNormal];b.titleLabel.font=[UIFont systemFontOfSize:11];}
+        else if(images[number]){[b setImage:images[number] forState:UIControlStateNormal];b.accessibilityLabel=[NSString stringWithFormat:@"عنصر %@",number];}
+        else{[b setTitle:[NSString stringWithFormat:@"%@ · المعاينة غير متاحة",number] forState:UIControlStateNormal];b.titleLabel.font=[UIFont systemFontOfSize:11];}
         [b addTarget:self action:@selector(choose:) forControlEvents:UIControlEventTouchUpInside];[self.body addSubview:b];[self.tiles addObject:b];
     }self.galleryTitle.text=@[@"Cue Skin",@"Avatar Frame",@"Avatar"][(NSUInteger)self.kind];[self setNeedsLayout];
 }
@@ -460,7 +440,7 @@ static void Export(void){
     self.profileTitle.frame=CGRectMake(pad,y,inside,24);y+=30;CGFloat cell=inside/7,starH=MIN(92,cell*.95);
     static const int codes[7]={105,109,107,101,104,108,106};
     for(UIButton *b in self.stars){b.frame=CGRectMake(pad+b.tag*cell,y,cell-5,starH);b.backgroundColor=atomic_load(&LevelOn)&&atomic_load(&LeagueValue)==codes[b.tag]?Cyan():UIColor.clearColor;}
-    y+=starH+8;self.levelLabel.frame=CGRectMake(pad,y,inside/2,26);self.valueLabel.frame=CGRectMake(pad+inside/2,y,inside/2,26);self.valueLabel.text=[NSString stringWithFormat:@"%d",atomic_load(&LevelValue)];y+=29;
+    y+=starH+8;self.levelLabel.frame=CGRectMake(pad,y,inside/2,26);self.valueLabel.frame=CGRectMake(pad+inside/2,y,inside/2,26);if(!self.slider.tracking)self.valueLabel.text=[NSString stringWithFormat:@"%d",atomic_load(&LevelValue)];y+=29;
     self.slider.frame=CGRectMake(pad,y,inside,32);if(!self.slider.tracking)self.slider.value=(float)atomic_load(&LevelValue);y+=44;
     self.segments.frame=CGRectMake(pad,y,inside,42);y+=49;self.galleryTitle.frame=CGRectMake(pad,y,inside,24);y+=31;
     CGFloat gap=7,tileW=(inside-gap*2)/3,tileH=self.kind==0?MAX(56,MIN(88,tileW*.28)):MAX(75,MIN(115,tileW*.5));
@@ -468,7 +448,7 @@ static void Export(void){
     for(NSUInteger i=0;i<self.tiles.count;i++){UIButton *b=self.tiles[i];b.frame=CGRectMake(pad+(i%3)*(tileW+gap),y+(i/3)*(tileH+gap),tileW,tileH);b.layer.borderWidth=b.tag==chosen?2:0;b.layer.borderColor=Cyan().CGColor;}
     y+=ceil(self.tiles.count/3.0)*(tileH+gap)+8;
     NSString *status=Access()?@"تغييرات المظهر محلية. القائمة تعرض العناصر التي رصدتها اللعبة فقط.":@"التفعيل غير نشط؛ الخيارات لن تُطبّق حتى تفعيل الاشتراك.";
-    if(!atomic_load(&IntegrityVerified))status=@"تعذر التحقق من مكتبة التفعيل؛ شارك تقرير المشكلة.";self.note.text=[status stringByAppendingString:@"\nاعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
+    if(!atomic_load(&IntegrityVerified))status=@"تعذر التحقق من مكتبة التفعيل؛ شارك تقرير المشكلة.";self.note.text=[status stringByAppendingString:@"\nتظهر هنا العناصر التي رصدتها اللعبة؛ المعاينة لا تعني امتلاك العنصر."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
     self.restoreButton.frame=CGRectMake(pad,y,inside/2,36);self.reportButton.frame=CGRectMake(pad+inside/2,y,inside/2,36);y+=46;self.body.contentSize=CGSizeMake(width,y);
 }
 - (void)tick {
@@ -509,8 +489,8 @@ static SkinMenuView *Menu;
 + (void)tick:(CADisplayLink *)link {(void)link;WireLoginDeveloper();[Menu tick];}
 @end
 __attribute__((constructor)) static void Start(void){dispatch_async(dispatch_get_main_queue(),^{
-    VerifyActivation();Lock=[NSObject new];ObservedNodes=[NSMapTable strongToWeakObjectsMapTable];CueDefinitions=[NSMutableDictionary dictionary];CueImages=[NSMutableDictionary dictionary];FrameImages=[NSMutableDictionary dictionary];AvatarImages=[NSMutableDictionary dictionary];CueIDs=[NSMutableSet set];FrameIDs=[NSMutableSet set];AvatarIDs=[NSMutableSet set];
-    NSUserDefaults *p=NSUserDefaults.standardUserDefaults;int level=(int)[p integerForKey:@"SkinMenu.Level"];atomic_store(&LevelValue,level>=1&&level<=999?level:100);int league=(int)[p integerForKey:@"SkinMenu.League"];BOOL validLeague=league==105||league==109||league==107||league==101||league==104||league==108||league==106;atomic_store(&LeagueValue,validLeague?league:105);atomic_store(&LevelOn,(int)[p integerForKey:@"SkinMenu.LevelOn"]);atomic_store(&CueValue,-1);atomic_store(&FrameValue,-1);atomic_store(&AvatarValue,-1);
+    VerifyActivation();Lock=[NSObject new];ObservedNodes=[NSMapTable strongToWeakObjectsMapTable];ThumbnailPending=[NSMutableSet set];ThumbnailMissing=[NSMutableSet set];CueDefinitions=[NSMutableDictionary dictionary];CueImages=[NSMutableDictionary dictionary];FrameImages=[NSMutableDictionary dictionary];AvatarImages=[NSMutableDictionary dictionary];CueIDs=[NSMutableSet set];FrameIDs=[NSMutableSet set];AvatarIDs=[NSMutableSet set];
+    NSUserDefaults *p=NSUserDefaults.standardUserDefaults;int level=(int)[p integerForKey:@"SkinMenu.Level"];atomic_store(&LevelValue,level>=1&&level<=999?level:100);int league=(int)[p integerForKey:@"SkinMenu.League"];BOOL validLeague=league==105||league==109||league==107||league==101||league==104||league==108||league==106;atomic_store(&LeagueValue,validLeague?league:105);atomic_store(&LevelOn,(int)[p integerForKey:@"SkinMenu.LevelOn"]);for(int kind=0;kind<3;kind++){NSString *key=@[@"SkinMenu.Cue",@"SkinMenu.Frame",@"SkinMenu.Avatar"][kind];NSInteger value=[p objectForKey:key]?[p integerForKey:key]:-1;int chosen=value>=-1&&value<=10000000?(int)value:-1;if(kind==0)atomic_store(&CueValue,chosen);else if(kind==1)atomic_store(&FrameValue,chosen);else atomic_store(&AvatarValue,chosen);}
     Menu=[[SkinMenuView alloc]initWithFrame:CGRectZero];Menu.hidden=YES;CADisplayLink *clock=[CADisplayLink displayLinkWithTarget:SkinMenuClock.class selector:@selector(tick:)];clock.preferredFramesPerSecond=20;[clock addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 });}
 
