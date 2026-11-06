@@ -42,9 +42,12 @@ static void (*OldLobby)(id,SEL,id,id);
 static void (*OldLobbyAvatar)(id,SEL),(*OldLobbyFrame)(id,SEL);
 static void (*OldCueDefinition)(id,SEL,id,int,int,BOOL);
 static int NativeLocalSide(id hud);
+static id FieldObject(id object,const char *name);
 static NSMutableSet *CueIDs,*FrameIDs,*AvatarIDs;
 
 static __weak id LastCue,LastWidget,LastHUD,LastAvatar,ActualManager;
+static BOOL (*OldUpdatePrompt)(id,SEL);
+static BOOL SuppressUpdatePrompt(id self,SEL cmd){(void)self;(void)cmd;return NO;}
 static void (*OldManagerCue)(id,SEL);
 static void (*OldManagerStarted)(id,SEL,const void *);
 static int OriginalCueID,OriginalCueLevel,HUDSide;
@@ -101,9 +104,8 @@ static id ObjectCall(id obj,const char *name) {
     return ok?((id(*)(id,SEL))objc_msgSend)(obj,s):nil;
 }
 static BOOL OwnID(id playerID,id offlineID) {
-    Class c=objc_getClass("UserInfo");id info=ObjectCall(c,"sharedUserInfo");id own=ObjectCall(info,"miniclipId");
-    if(![own isKindOfClass:NSString.class]||![(NSString *)own length]) return NO;
-    return [own isEqual:playerID]||[own isEqual:offlineID];
+    id info=ObjectCall(objc_getClass("UserInfo"),"sharedUserInfo");
+    for(NSString *name in @[@"userId",@"miniclipId"]){id own=ObjectCall(info,name.UTF8String);if([own isKindOfClass:NSString.class]&&[(NSString *)own length]&&([own isEqual:playerID]||[own isEqual:offlineID]))return YES;}return NO;
 }
 static NSMutableSet *IDs(int kind) { return kind==0?CueIDs:kind==1?FrameIDs:AvatarIDs; }
 static NSMutableDictionary *Images(int kind) { return kind==0?CueImages:kind==1?FrameImages:AvatarImages; }
@@ -131,6 +133,8 @@ static void NewCue(id self,SEL cmd,int cue,int level,BOOL opponent) {
     atomic_store(&CueCurrentlyOpponent,opponent);int previousScope=CueRenderScope;CueRenderScope=opponent?-1:1;
     if(!opponent){@synchronized(Lock){LastCue=self;OriginalCueID=cue;OriginalCueLevel=level;}LocalCueDepth++;}
     OldCue(self,cmd,cue,level,opponent);
+    id widget=FieldObject(self,"_cueWidget");
+    if(widget){objc_setAssociatedObject(widget,&LocalKey,@(!opponent),OBJC_ASSOCIATION_RETAIN_NONATOMIC);if(!opponent){@synchronized(Lock){LastCueWidget=widget;}atomic_store(&Dirty,true);}}
     if(!opponent)LocalCueDepth--;CueRenderScope=previousScope;
 }
 static void NewCueSetup(id self,SEL cmd,int cue,int level) {OldCueSetup(self,cmd,cue,level);}
@@ -158,6 +162,7 @@ static void NewTrophy(id self,SEL cmd,id league,id level){UpdateLobbyView(self,c
 static void HUDStar(id self,SEL cmd,unsigned league,unsigned level,int side) {
     atomic_fetch_add(&HUDCalls,1);objc_setAssociatedObject(self,side==1?&HUD1ArgsKey:&HUD2ArgsKey,@[@(league),@(level)],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     int nativeSide=NativeLocalSide(self);BOOL local=NO;@synchronized(Lock){if(LastHUD!=self){HUDSide=0;atomic_store(&LocalHUDFound,false);}LastHUD=self;if(nativeSide){HUDSide=nativeSide;atomic_store(&LocalHUDFound,true);}local=HUDSide==side;}
+    if(local)MarkAvatar(FieldObject(self,side==1?"_player1Avatar":"_player2Avatar"));
     BOOL on=local&&Access()&&atomic_load(&LevelOn);
     (side==1?OldHUD1:OldHUD2)(self,cmd,on?(unsigned)atomic_load(&LeagueValue):league,on?(unsigned)atomic_load(&LevelValue):level);
 }
@@ -167,7 +172,7 @@ static void NewHUDAllAvatar(id self,SEL cmd,id avatar,int fallback,id playerID,i
     if(OwnID(playerID,offlineID)) {
         MarkAvatar(avatar);
         // Identify which player slot owns this avatar from the game's existing avatar properties.
-        id p1=ObjectCall(self,"player1Avatar"),p2=ObjectCall(self,"player2Avatar");
+        id p1=FieldObject(self,"_player1Avatar"),p2=FieldObject(self,"_player2Avatar");
         int side=avatar==p1?1:avatar==p2?2:0;
         if(side){@synchronized(Lock){LastHUD=self;HUDSide=side;}atomic_store(&LocalHUDFound,true);atomic_store(&Dirty,true);}
     }
@@ -226,14 +231,18 @@ static BOOL Args(Method m,const char *ret,const char **args,unsigned count){
     for(unsigned i=0;i<count&&ok;i++){t=method_copyArgumentType(m,i);ok=t&&strcmp(t,args[i])==0;free(t);}return ok;
 }
 static id FieldObject(id object,const char *name){if(!object)return nil;Ivar ivar=class_getInstanceVariable(object_getClass(object),name);const char *type=ivar?ivar_getTypeEncoding(ivar):NULL;return type&&type[0]=='@'?object_getIvar(object,ivar):nil;}
-static void NewManagerCue(id self,SEL cmd){@synchronized(Lock){ActualManager=self;}OldManagerCue(self,cmd);}
+static void NewManagerCue(id self,SEL cmd){@synchronized(Lock){ActualManager=self;}OldManagerCue(self,cmd);atomic_store(&Dirty,true);}
 static void NewManagerStarted(id self,SEL cmd,const void *event){@synchronized(Lock){ActualManager=self;}OldManagerStarted(self,cmd,event);}
 static int NativeLocalSide(id hud){
     id manager=nil;@synchronized(Lock){manager=ActualManager;}if(!manager)manager=ObjectCall(objc_getClass("GameManager"),"sharedGameManager");
     id player=ObjectCall(manager,"player");if(!player)player=FieldObject(manager,"mPlayer");if(!hud||!player)return 0;
+    // Slot rendering is a separate child, not the GameHUD that owns player identities.
+    id owner=ObjectCall(manager,"gameHUD");if(!owner)owner=FieldObject(manager,"mGameHUD");
+    id renderer=FieldObject(owner,"_gameHUDTwoPlayerGame");
+    if(hud!=owner&&hud!=renderer)return 0;
     const char *args[]={"@",":","@"};const char *names[]={"isPlayer1:","isPlayer2:"};
-    for(int i=0;i<2;i++){SEL sel=sel_registerName(names[i]);Method m=class_getInstanceMethod(object_getClass(hud),sel);if(Args(m,"B",args,3)&&((BOOL(*)(id,SEL,id))objc_msgSend)(hud,sel,player))return i+1;}
-    id localID=FieldObject(player,"mId");for(int side=1;side<=2;side++){id slot=FieldObject(hud,side==1?"_player1":"_player2");if(slot==player)return side;id otherID=FieldObject(slot,"mId");if([localID isKindOfClass:NSString.class]&&[(NSString *)localID length]&&[localID isEqual:otherID])return side;}return 0;
+    for(int i=0;i<2;i++){SEL sel=sel_registerName(names[i]);Method m=class_getInstanceMethod(object_getClass(owner),sel);if(Args(m,"B",args,3)&&((BOOL(*)(id,SEL,id))objc_msgSend)(owner,sel,player))return i+1;}
+    id localID=FieldObject(player,"mId");for(int side=1;side<=2;side++){id slot=FieldObject(owner,side==1?"_player1":"_player2");if(slot==player)return side;id otherID=FieldObject(slot,"mId");if([localID isKindOfClass:NSString.class]&&[(NSString *)localID length]&&[localID isEqual:otherID])return side;}return 0;
 }
 static BOOL Install(const char *cn,const char *mn,BOOL meta,IMP replacement,IMP *old,const char *ret,const char **args,unsigned n){
     if(*old)return YES;Class cls=objc_getClass(cn);if(!cls)return NO;if(meta)cls=object_getClass(cls);SEL sel=sel_registerName(mn);Method m=class_getInstanceMethod(cls,sel);if(!Args(m,ret,args,n))return NO;
@@ -307,6 +316,7 @@ static void InstallHooks(void){
     const char *eventArgs[]={"@",":","r^v"};
     Install("GameManager","setActiveVisualCue",NO,(IMP)NewManagerCue,(IMP *)&OldManagerCue,"v",factory,2);
     Install("GameManager","networkEventGameStarted:",NO,(IMP)NewManagerStarted,(IMP *)&OldManagerStarted,"v",eventArgs,3);
+    Install("UserInfo","showUpdatePopup",NO,(IMP)SuppressUpdatePrompt,(IMP *)&OldUpdatePrompt,"B",factory,2);
     BOOL star=Install("MatchScreenPlayerWidget","setupStarWithLeague:andLevel:",NO,(IMP)NewStar,(IMP *)&OldStar,"v",pair,4);
     BOOL local=star&&Install("MatchScreenPlayerWidget","createLocalPlayerWidget",YES,(IMP)NewLocal,(IMP *)&OldLocalFactory,"@",factory,2);
     const char *definitionArgs[]={"@",":","@","i","i","B"},*lobbyArgs[]={"@",":","@","@"};
@@ -370,7 +380,7 @@ static UIColor *Dark(void){return [UIColor colorWithRed:.075 green:.10 blue:.13 
 static UIImage *Asset(NSString *name){Dl_info d={0};if(!dladdr((const void *)Asset,&d)||!d.dli_fname)return nil;NSString *dir=[@(d.dli_fname) stringByDeletingLastPathComponent];return [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name]];}
 static void Changed(void){NSUserDefaults *p=NSUserDefaults.standardUserDefaults;[p setInteger:atomic_load(&LevelOn) forKey:@"SkinMenu.LevelOn"];[p setInteger:atomic_load(&LevelValue) forKey:@"SkinMenu.Level"];[p setInteger:atomic_load(&LeagueValue) forKey:@"SkinMenu.League"];atomic_store(&Dirty,true);atomic_store(&DiscoveryRequested,true);}
 static void Export(void){
-    NSDictionary *report=@{@"format":@"SkinMenu-5",@"actualManagerCaptured":@(ActualManager!=nil),@"gameManagerPresent":@(ObjectCall(objc_getClass("GameManager"),"sharedGameManager")!=nil),@"localPlayerPresent":@(ObjectCall(ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),"player")!=nil),@"activationTextVerified":@(atomic_load(&IntegrityVerified)),@"trophyHookInstalled":@(OldTrophy!=NULL),@"trophyCalls":@(atomic_load(&TrophyCalls)),@"ownFrameWorstMs":@(atomic_load(&OwnMaxMicros)/1000.0),@"gameFrameWorstMs":@(atomic_load(&BaseMaxMicros)/1000.0),@"ownSlowFrames":@(atomic_load(&SlowOwnFrames)),@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
+    NSDictionary *report=@{@"format":@"SkinMenu-6",@"optionalUpdatePromptHook":@(OldUpdatePrompt!=NULL),@"actualManagerCaptured":@(ActualManager!=nil),@"gameManagerPresent":@(ObjectCall(objc_getClass("GameManager"),"sharedGameManager")!=nil),@"localPlayerPresent":@(ObjectCall(ObjectCall(objc_getClass("GameManager"),"sharedGameManager"),"player")!=nil),@"activationTextVerified":@(atomic_load(&IntegrityVerified)),@"trophyHookInstalled":@(OldTrophy!=NULL),@"trophyCalls":@(atomic_load(&TrophyCalls)),@"ownFrameWorstMs":@(atomic_load(&OwnMaxMicros)/1000.0),@"gameFrameWorstMs":@(atomic_load(&BaseMaxMicros)/1000.0),@"ownSlowFrames":@(atomic_load(&SlowOwnFrames)),@"cueRootInstalled":@(OldCueRoot!=NULL),@"cueRootCalls":@(atomic_load(&CueRootCalls)),@"accountLinksConfigured":@(AccountLinksConfigured),@"lobbyHookInstalled":@(OldLobby!=NULL),@"cueDefinitionHookInstalled":@(OldCueDefinition!=NULL),@"lobbyCalls":@(atomic_load(&LobbyCalls)),@"cueAppearanceApplied":@(atomic_load(&CueAppearanceApplied)),@"displayLevel":@(atomic_load(&LevelValue)),@"displayLeague":@(atomic_load(&LeagueValue)),@"selectedCueProduct":@(atomic_load(&CueValue)),@"engineMatched":@(NinjaVerified),@"accessActive":@(Access()),@"levelEnabled":@(atomic_load(&LevelOn)),@"localHUDIdentified":@(atomic_load(&LocalHUDFound)),@"calls":@{@"cue":@(atomic_load(&CueCalls)),@"preMatchStar":@(atomic_load(&StarCalls)),@"matchStar":@(atomic_load(&HUDCalls)),@"frame":@(atomic_load(&FrameCalls)),@"avatar":@(atomic_load(&AvatarCalls)),@"draw":@(atomic_load(&DrawCalls)),@"offMain":@(atomic_load(&OffMainCalls))},@"scope":@"No user identifiers, tokens or keys; only renderer call counts and integration state",@"hooks":HookDescription};
     NSError *e=nil;NSData *data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:&e];NSURL *dir=[NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;NSURL *file=[dir URLByAppendingPathComponent:@"SkinMenu-report.json"];
     if(!data||![data writeToURL:file options:NSDataWritingAtomic error:&e])return;
     UIActivityViewController *s=[[UIActivityViewController alloc]initWithActivityItems:@[file] applicationActivities:nil];UIViewController *top=Top();if(!top)return;s.popoverPresentationController.sourceView=top.view;s.popoverPresentationController.sourceRect=CGRectMake(CGRectGetMidX(top.view.bounds),CGRectGetMidY(top.view.bounds),1,1);[top presentViewController:s animated:YES completion:nil];
@@ -457,7 +467,7 @@ static void Export(void){
     int chosen=self.kind==0?atomic_load(&CueValue):self.kind==1?atomic_load(&FrameValue):atomic_load(&AvatarValue);
     for(NSUInteger i=0;i<self.tiles.count;i++){UIButton *b=self.tiles[i];b.frame=CGRectMake(pad+(i%3)*(tileW+gap),y+(i/3)*(tileH+gap),tileW,tileH);b.layer.borderWidth=b.tag==chosen?2:0;b.layer.borderColor=Cyan().CGColor;}
     y+=ceil(self.tiles.count/3.0)*(tileH+gap)+8;
-    NSString *status=Access()?@"تغييرات المظهر محلية. الصور من العناصر التي عُرضت على الجهاز.":@"التفعيل غير نشط؛ الخيارات لن تُطبّق حتى تفعيل الاشتراك.";
+    NSString *status=Access()?@"تغييرات المظهر محلية. القائمة تعرض العناصر التي رصدتها اللعبة فقط.":@"التفعيل غير نشط؛ الخيارات لن تُطبّق حتى تفعيل الاشتراك.";
     if(!atomic_load(&IntegrityVerified))status=@"تعذر التحقق من مكتبة التفعيل؛ شارك تقرير المشكلة.";self.note.text=[status stringByAppendingString:@"\nاعرض العناصر في اللعبة أو المتجر مرة واحدة لتظهر صورها هنا."];self.note.textColor=Access()?[UIColor colorWithWhite:.65 alpha:1]:[UIColor colorWithRed:1 green:.5 blue:.5 alpha:1];self.note.frame=CGRectMake(pad,y,inside,48);y+=50;
     self.restoreButton.frame=CGRectMake(pad,y,inside/2,36);self.reportButton.frame=CGRectMake(pad+inside/2,y,inside/2,36);y+=46;self.body.contentSize=CGSizeMake(width,y);
 }
